@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Bangumini",
+    "slug": "bangumini-mobile",
+    "scheme": "bangumini",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "plugins": [
+      "./plugins/withAndroidConfig",
+      "expo-router",
+      "expo-secure-store",
+      "expo-sqlite",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#101216",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain"
+        }
+      ]
+    ],
+    "android": {
+      "package": "dev.raycast.bangumini",
+      "adaptiveIcon": {
+        "backgroundColor": "#101216"
+      },
+      "permissions": [
+        "android.permission.INTERNET"
+      ]
+    }
+  }
+}

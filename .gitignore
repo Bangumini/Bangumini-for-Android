@@ -1,0 +1,14 @@
+node_modules/
+.expo/
+android/.gradle/
+android/app/build/
+android/build/
+android/keystore.properties
+android/app/*.keystore
+dist/
+build/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+node_modules/

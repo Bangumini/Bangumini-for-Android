@@ -10,6 +10,7 @@ export interface Rating {
   total: number;
   count: Record<string, number>;
   score: number;
+  rank: number;
 }
 
 export interface SubjectSmall {

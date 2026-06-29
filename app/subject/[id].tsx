@@ -21,6 +21,7 @@ import {
   readCachedCollectionWithin,
   readCachedEpisodesWithin,
   readCachedPersonsWithin,
+  readCachedSubject,
   readCachedSubjectDeepWithin,
   writeCachedCharacters,
   writeCachedCollection,
@@ -48,6 +49,15 @@ async function loadSubject(subjectId: number, force = false) {
   }
 
   const subject = await getSubject(subjectId);
+
+  // air_weekday is not returned by /v0/subjects/{id}, but the calendar API
+  // (loaded on the collections page) writes it to the SQLite subject cache.
+  // Backfill from cache so the merge in writeCachedSubject preserves it.
+  if (subject.air_weekday == null) {
+    const cached = await readCachedSubject(subjectId);
+    if (cached?.air_weekday != null) subject.air_weekday = cached.air_weekday;
+  }
+
   return writeCachedSubject(subject);
 }
 
@@ -275,9 +285,11 @@ export default function SubjectDetailPage() {
           {subject.name_cn ? <Text style={styles.subtitle}>{subject.name}</Text> : null}
           <View style={styles.metaGrid}>
             <Text style={styles.meta}>评分 {subject.rating?.score ? subject.rating.score.toFixed(1) : "暂无"}</Text>
-            <Text style={styles.meta}>{subject.rank ? `排名 #${subject.rank}` : "暂无排名"}</Text>
+            <Text style={styles.meta}>{subject.rating?.rank ? `排名 #${subject.rating.rank}` : "暂无排名"}</Text>
             <Text style={styles.meta}>{subject.date || "日期未知"}</Text>
-            <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday) ?? "放送日未知"}</Text>
+            {getAirWeekdayLabel(subject.air_weekday) ? (
+              <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday)}</Text>
+            ) : null}
           </View>
         </View>
       </View>

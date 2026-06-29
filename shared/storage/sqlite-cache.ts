@@ -132,8 +132,8 @@ function mergeSubjectFull(current: Subject | null, incoming: Subject): Subject {
 async function ensureAccessedAtColumn(db: Database, tableName: string) {
   const columns = await db.select<Array<{ name: string }>>(`PRAGMA table_info(${tableName})`);
   if (columns.some((column) => column.name === "accessed_at")) return;
-  await db.execute(`ALTER TABLE ${tableName} ADD COLUMN accessed_at INTEGER DEFAULT 0`);
-  await db.execute(`UPDATE ${tableName} SET accessed_at = updated_at WHERE accessed_at = 0 OR accessed_at IS NULL`);
+  await db.execute(`ALTER TABLE ${tableName} ADD COLUMN accessed_at INTEGER NOT NULL DEFAULT 0`);
+  await db.execute(`UPDATE ${tableName} SET accessed_at = updated_at WHERE accessed_at = 0`);
 }
 
 async function initializeSchema(db: Database) {
@@ -208,6 +208,15 @@ function rewriteSqlPlaceholders(sql: string) {
   return sql.replace(/\$\d+/g, "?");
 }
 
+function expandSqlBindings(sql: string, bindings: unknown[]): unknown[] {
+  const expanded: unknown[] = [];
+  sql.replace(/\$(\d+)/g, (_match, num) => {
+    expanded.push(bindings[parseInt(num) - 1]);
+    return "?";
+  });
+  return expanded;
+}
+
 function createDatabaseAdapter(sqliteDb: SQLite.SQLiteDatabase): Database {
   return {
     async execute(sql: string, bindings: unknown[] = []) {
@@ -215,12 +224,16 @@ function createDatabaseAdapter(sqliteDb: SQLite.SQLiteDatabase): Database {
         await sqliteDb.execAsync(sql);
         return;
       }
-      await sqliteDb.runAsync(rewriteSqlPlaceholders(sql), bindings as SQLite.SQLiteBindParams);
+      const rewritten = rewriteSqlPlaceholders(sql);
+      const expanded = expandSqlBindings(sql, bindings);
+      await sqliteDb.runAsync(rewritten, expanded as SQLite.SQLiteBindParams);
     },
     async select<T>(sql: string, bindings: unknown[] = []) {
+      const rewritten = rewriteSqlPlaceholders(sql);
+      const expanded = expandSqlBindings(sql, bindings);
       const rows = await sqliteDb.getAllAsync(
-        rewriteSqlPlaceholders(sql),
-        bindings as SQLite.SQLiteBindParams,
+        rewritten,
+        expanded as SQLite.SQLiteBindParams,
       );
       return rows as T;
     },
@@ -232,7 +245,8 @@ async function withDatabase<T>(fn: (db: Database) => Promise<T>, fallback: T): P
     const db = await getDatabase();
     return await fn(db);
   } catch (error) {
-    console.warn("[sqlite-cache] storage unavailable", error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[sqlite-cache] storage unavailable:", message);
     return fallback;
   }
 }
@@ -313,7 +327,7 @@ function subjectFromSmall(subject: SubjectSmall): Subject {
     summary: subject.summary,
     eps: (subject as unknown as { eps?: number }).eps ?? 0,
     total_episodes: (subject as unknown as { total_episodes?: number }).total_episodes ?? 0,
-    rating: subject.rating ?? { total: 0, count: {}, score: 0 },
+    rating: subject.rating ?? { total: 0, count: {}, score: 0, rank: 0 },
     rank: subject.rank,
     date: subject.air_date,
     air_weekday: subject.air_weekday,

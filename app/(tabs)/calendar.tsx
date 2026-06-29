@@ -8,6 +8,7 @@ import type { CalendarItem } from "../../shared/api/types";
 import { getTodayBangumiWeekday, WEEKDAY_CN } from "../../shared/sort-collections";
 import {
   getPreferredSubjectCoverUrl,
+  readCachedValue,
   readCachedValueWithin,
   writeCachedSubjectPreviews,
   writeCachedValue,
@@ -27,6 +28,15 @@ async function loadCalendar(force = false) {
   if (!force) {
     const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE);
     if (cached) return cached;
+    // Cache expired — try stale cache before hitting network
+    const stale = await readCachedValue<CalendarItem[]>("calendar");
+    if (stale) {
+      getCalendar().then((data) => {
+        writeCachedValue("calendar", data);
+        writeCachedSubjectPreviews(data.flatMap((day) => day.items));
+      }).catch(() => {});
+      return stale;
+    }
   }
   const data = await getCalendar();
   await writeCachedValue("calendar", data);

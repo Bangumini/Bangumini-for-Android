@@ -17,6 +17,7 @@ import {
   readCachedValueWithin,
   readCachedValues,
   readCachedValuesWithin,
+  writeCachedSubject,
   writeCachedSubjectPreviews,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
@@ -32,7 +33,6 @@ const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const AIRING_CACHE_PREFIX = "anilist-airing-";
 const EPISODES_CACHE_PREFIX = "episodes-";
 const AIRING_TIME_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 90;
-const AIRING_REQUEST_DELAY = 250;
 
 const EMPTY_AIRING_MAP = new Map<number, number>();
 const EMPTY_AIRING_TIME_MAP = new Map<number, { airingAt: number; episode: number }>();
@@ -58,6 +58,16 @@ async function loadCollections(type: CollectionType, username: string, force = f
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
     if (cached) return cached;
+    // Cache miss or expired — try stale cache before hitting network
+    const stale = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
+    if (stale) {
+      // Return stale cache immediately, refresh in background
+      getAllUserCollections({ username, type }).then((data) => {
+        writeCachedValue(cacheKey, data);
+        writeCachedSubjectPreviews(data.data.map((c) => c.subject));
+      }).catch(() => {});
+      return stale;
+    }
   }
 
   const data = await getAllUserCollections({ username, type });
@@ -70,6 +80,15 @@ async function loadCalendar(force = false) {
   if (!force) {
     const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE);
     if (cached) return cached;
+    // Cache miss or expired — try stale cache before hitting network
+    const stale = await readCachedValue<CalendarItem[]>("calendar");
+    if (stale) {
+      getCalendar().then((data) => {
+        writeCachedValue("calendar", data);
+        writeCachedSubjectPreviews(data.flatMap((day) => day.items));
+      }).catch(() => {});
+      return stale;
+    }
   }
   const data = await getCalendar();
   await writeCachedValue("calendar", data);
@@ -136,7 +155,7 @@ export default function CollectionsPage() {
       const totals = new Map<number, number>();
       for (const c of rawCollections) {
         const s = c.subject;
-        if (s.total_episodes == null && !s.eps) {  // Check for null or 0
+        if ((s.total_episodes == null || s.total_episodes === 0) && !s.eps) {
           const cached = await readCachedSubject(s.id);
           if (cached?.total_episodes) totals.set(s.id, cached.total_episodes);
           else if (cached?.eps) totals.set(s.id, cached.eps);
@@ -179,7 +198,12 @@ export default function CollectionsPage() {
         );
         for (const result of results) {
           if (result.status === "fulfilled") {
-            totals.set(result.value.id, result.value.totalEp);
+            const { id, totalEp } = result.value;
+            totals.set(id, totalEp);
+            // Persist correct total_episodes to SQLite so it survives cold start
+            readCachedSubject(id).then((cached) => {
+              if (cached) return writeCachedSubject({ ...cached, total_episodes: totalEp });
+            }).catch(() => {});
           }
         }
       }
@@ -188,6 +212,7 @@ export default function CollectionsPage() {
     },
     enabled: subjectsNeedingEpisodes.length > 0,
     staleTime: CACHE_MAX_AGE,
+    gcTime: CACHE_MAX_AGE * 2,
   });
 
   // --- Phase 3: AniList airing times (only for watching tab) ---
@@ -208,8 +233,12 @@ export default function CollectionsPage() {
     queryFn: async () => {
       const map = new Map<number, AiringTime>();
       const cacheKeys = airingTimeTargets.map((t) => `${AIRING_CACHE_PREFIX}${t.subjectId}`);
-      const cachedByKey = await readCachedValuesWithin<AiringTime>(cacheKeys, AIRING_TIME_CACHE_MAX_AGE);
-      const staleByKey = await readCachedValues<AiringTime>(cacheKeys);
+
+      // Read fresh and stale caches in parallel
+      const [cachedByKey, staleByKey] = await Promise.all([
+        readCachedValuesWithin<AiringTime>(cacheKeys, AIRING_TIME_CACHE_MAX_AGE),
+        readCachedValues<AiringTime>(cacheKeys),
+      ]);
 
       for (const target of airingTimeTargets) {
         const key = `${AIRING_CACHE_PREFIX}${target.subjectId}`;
@@ -220,20 +249,37 @@ export default function CollectionsPage() {
       }
 
       const missing = airingTimeTargets.filter((t) => !map.has(t.subjectId));
-      for (let i = 0; i < missing.length; i++) {
-        const target = missing[i];
-        if (!target.name) continue;
-        if (i > 0) await new Promise((r) => setTimeout(r, AIRING_REQUEST_DELAY));
-        const result = await getAiringAt(target.name);
-        if (result) {
-          await writeCachedValue(`${AIRING_CACHE_PREFIX}${target.subjectId}`, result);
-          map.set(target.subjectId, result);
+      // Batch-fetch with concurrency; abort when network is unavailable
+      const AIRING_BATCH_SIZE = 3;
+      for (let i = 0; i < missing.length; i += AIRING_BATCH_SIZE) {
+        const batch = missing.slice(i, i + AIRING_BATCH_SIZE).filter((t) => t.name);
+        if (batch.length === 0) continue;
+
+        const results = await Promise.allSettled(
+          batch.map(async (target) => {
+            const result = await getAiringAt(target.name);
+            return { target, result };
+          }),
+        );
+
+        let allEmpty = true;
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value.result) {
+            allEmpty = false;
+            const { target, result } = r.value;
+            await writeCachedValue(`${AIRING_CACHE_PREFIX}${target.subjectId}`, result);
+            map.set(target.subjectId, result);
+          }
         }
+
+        // Entire batch returned no data — network likely unavailable, skip remaining
+        if (allEmpty) break;
       }
       return map;
     },
     enabled: airingTimeTargets.length > 0,
     staleTime: 5 * 60 * 1000,
+    gcTime: CACHE_MAX_AGE * 2,
   });
 
   const airingTimeMap = airingTimeMapData ?? EMPTY_AIRING_TIME_MAP;
@@ -251,9 +297,13 @@ export default function CollectionsPage() {
       const map = new Map<number, number>();
       const idsToFetch: number[] = [];
 
+      // Batch-read all cached episode counts instead of sequential per-ID queries
+      const cacheKeys = airingIds.map((id) => `${EPISODES_CACHE_PREFIX}${id}`);
+      const cachedByKey = await readCachedValues<{ airedEp: number; checkedAt: number }>(cacheKeys);
+
       for (const id of airingIds) {
         const cacheKey = `${EPISODES_CACHE_PREFIX}${id}`;
-        const cached = await readCachedValue<{ airedEp: number; checkedAt: number }>(cacheKey);
+        const cached = cachedByKey.get(cacheKey);
         if (cached && Date.now() - cached.checkedAt <= CACHE_MAX_AGE) {
           map.set(id, cached.airedEp);
           continue;
@@ -283,6 +333,7 @@ export default function CollectionsPage() {
     },
     enabled: isWatching && airingIds.length > 0,
     staleTime: CACHE_MAX_AGE,
+    gcTime: CACHE_MAX_AGE * 2,
   });
 
   const episodeMap = airedEpMap ?? EMPTY_EPISODE_MAP;

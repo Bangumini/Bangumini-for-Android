@@ -100,6 +100,11 @@ async function loadNextSeason(force = false) {
   if (!force) {
     const cached = await readCachedValueWithin<NextSeasonItem[]>(key, CACHE_MAX_AGE);
     if (cached) return cached;
+    const stale = await readCachedValue<NextSeasonItem[]>(key);
+    if (stale) {
+      getNextSeason().then((data) => writeCachedValue(key, data)).catch(() => {});
+      return stale;
+    }
   }
   const data = await getNextSeason();
   await writeCachedValue(key, data);
@@ -164,9 +169,21 @@ export default function NextSeasonPage() {
     queryKey: ["next-season", seasonInfo.seasonYear, seasonInfo.season],
     queryFn: async () => {
       const items = await loadNextSeason();
-      const { entries } = await resolveBangumiMatches(items, true);
+      // Use cached matches first (refresh=false), background refresh later
+      const { entries, needsRefresh } = await resolveBangumiMatches(items, false);
+      // If some matches are missing and we're online, try to fetch them
+      if (needsRefresh) {
+        resolveBangumiMatches(items, true).then((refreshed) => {
+          queryClient.setQueryData(
+            ["next-season", seasonInfo.seasonYear, seasonInfo.season],
+            refreshed.entries,
+          );
+        }).catch(() => {});
+      }
       return entries;
     },
+    staleTime: CACHE_MAX_AGE,
+    gcTime: CACHE_MAX_AGE * 2,
   });
 
   const allEntries = nextSeasonQuery.data ?? [];

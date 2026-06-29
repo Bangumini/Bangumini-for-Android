@@ -1,12 +1,14 @@
-import { Component, useEffect, useState, type ReactNode } from "react";
+import { Component, useCallback, useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
+import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { getAccessToken } from "../src/api/oauth";
 import { colors } from "../src/theme/colors";
 import { setTokenProvider } from "../shared/api/client";
@@ -47,6 +49,7 @@ class RootErrorBoundary extends Component<{ children: ReactNode }, RootErrorBoun
 }
 
 export default function RootLayout() {
+  const [fontsLoaded] = useFonts(Ionicons.font);
   const [ready, setReady] = useState(false);
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
@@ -68,13 +71,15 @@ export default function RootLayout() {
     setReady(true);
   }, []);
 
+  const allReady = fontsLoaded && ready;
+
   useEffect(() => {
-    if (ready) {
+    if (allReady) {
       SplashScreen.hideAsync().catch(() => {});
     }
-  }, [ready]);
+  }, [allReady]);
 
-  if (!ready) return null;
+  if (!allReady) return null;
 
   return (
     <RootErrorBoundary>

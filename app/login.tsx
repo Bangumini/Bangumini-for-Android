@@ -18,6 +18,7 @@ export default function LoginPage() {
       router.replace("/collections");
     } catch (error) {
       Alert.alert("登录失败", error instanceof Error ? error.message : "请稍后重试");
+      router.back();
     } finally {
       setLoading(false);
     }

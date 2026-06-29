@@ -1,4 +1,4 @@
-import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { colors } from "../theme/colors";
 
@@ -19,32 +19,38 @@ export function SegmentedControl<T extends string | number>({
   onChange,
 }: SegmentedControlProps<T>) {
   return (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
-      contentContainerStyle={styles.container}
-    >
-      {options.map((option) => {
-        const active = option.value === value;
-        return (
-          <Pressable
-            key={String(option.value)}
-            onPress={() => onChange(option.value)}
-            style={[styles.segment, active && styles.activeSegment]}
-          >
-            <Text style={[styles.label, active && styles.activeLabel]} numberOfLines={1}>
-              {option.label}
-            </Text>
-          </Pressable>
-        );
-      })}
-    </ScrollView>
+    <View style={styles.wrapper}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.container}
+        bounces={false}
+      >
+        {options.map((option, index) => {
+          const active = option.value === value;
+          const isLast = index === options.length - 1;
+          return (
+            <Pressable
+              key={String(option.value)}
+              onPress={() => onChange(option.value)}
+              style={[styles.segment, active && styles.activeSegment, !isLast && styles.segmentGap]}
+            >
+              <Text style={[styles.label, active && styles.activeLabel]} numberOfLines={1}>
+                {option.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  wrapper: {
+    flex: 0,
+  },
   container: {
-    gap: 8,
     paddingHorizontal: 16,
     paddingVertical: 10,
   },
@@ -57,6 +63,9 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
     backgroundColor: colors.surface,
+  },
+  segmentGap: {
+    marginRight: 8,
   },
   activeSegment: {
     borderColor: colors.primary,

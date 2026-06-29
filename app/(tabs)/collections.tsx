@@ -11,6 +11,7 @@ import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import { getDisplayLabel, getTodayBangumiWeekday, sortCollections } from "../../shared/sort-collections";
 import {
   getPreferredSubjectCoverUrl,
+  readCachedSubject,
   readCachedValueWithin,
   writeCachedSubjectPreviews,
   writeCachedValue,
@@ -39,13 +40,28 @@ async function loadCollections(type: CollectionType, username: string, force = f
   const cacheKey = `collections-${type}-${username}`;
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
-    if (cached) return cached;
+    if (cached) {
+      await fillMissingTotalEpisodes(cached.data);
+      return cached;
+    }
   }
 
   const data = await getAllUserCollections({ username, type });
   await writeCachedValue(cacheKey, data);
   await writeCachedSubjectPreviews(data.data.map((collection) => collection.subject));
+  await fillMissingTotalEpisodes(data.data);
   return data;
+}
+
+async function fillMissingTotalEpisodes(collections: UserCollection[]) {
+  for (const collection of collections) {
+    const s = collection.subject;
+    if (!s.total_episodes && !s.eps) {
+      const cached = await readCachedSubject(s.id);
+      if (cached?.total_episodes) s.total_episodes = cached.total_episodes;
+      if (cached?.eps) s.eps = cached.eps;
+    }
+  }
 }
 
 async function loadCalendar(force = false) {

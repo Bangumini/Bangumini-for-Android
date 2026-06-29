@@ -98,7 +98,9 @@ async function loadCharacters(subjectId: number) {
 }
 
 function getTotalEpisodes(subject?: Subject | null, episodes?: PagedResponse<Episode> | null) {
-  return subject?.total_episodes || subject?.eps || episodes?.data?.filter((episode) => episode.type === 0).length || 0;
+  const normalCount = episodes?.data?.filter((episode) => episode.type === 0).length;
+  if (normalCount) return normalCount;
+  return subject?.total_episodes || subject?.eps || 0;
 }
 
 function getAirWeekdayLabel(weekday?: number) {

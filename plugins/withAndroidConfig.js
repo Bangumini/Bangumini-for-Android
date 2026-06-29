@@ -104,6 +104,14 @@ function withSecureStoreBackupRules(config) {
         path.join(xmlDir, "secure_store_data_extraction_rules.xml"),
         DATA_EXTRACTION_RULES_XML
       );
+
+      // Prevent shrinkResources from stripping icon fonts loaded at runtime
+      const rawDir = path.join(platformRoot, "app", "src", "main", "res", "raw");
+      fs.mkdirSync(rawDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(rawDir, "keep.xml"),
+        '<?xml version="1.0" encoding="utf-8"?>\n<resources xmlns:tools="http://schemas.android.com/tools"\n    tools:keep="@font/ionicons,@font/MaterialIcons,@font/MaterialCommunityIcons,@font/FontAwesome5_Solid,@font/FontAwesome5_Brands,@font/FontAwesome5_Regular" />\n'
+      );
       return config;
     },
   ]);

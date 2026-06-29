@@ -71,9 +71,12 @@ export function isUsefulImageUrl(url?: string | null): boolean {
 export function getPreferredSubjectCoverUrl(subject: Subject | SubjectSmall | null | undefined) {
   const images = subject?.images;
   if (!images) return null;
+  // Prefer original/large for calendar (direct uploads without CDN resizer),
+  // then medium (800px via CDN /r/800/) for collections, then fallbacks
   return (
-    [images.small, images.common, images.medium, images.large, images.grid].find(isUsefulImageUrl) ??
-    null
+    [images.large, images.medium, images.common, images.small, images.grid]
+      .find(isUsefulImageUrl)
+      ?.replace(/^http:/, "https:") ?? null
   );
 }
 
@@ -308,8 +311,8 @@ function subjectFromSmall(subject: SubjectSmall): Subject {
     type: subject.type,
     images: subject.images,
     summary: subject.summary,
-    eps: 0,
-    total_episodes: 0,
+    eps: (subject as unknown as { eps?: number }).eps ?? 0,
+    total_episodes: (subject as unknown as { total_episodes?: number }).total_episodes ?? 0,
     rating: subject.rating ?? { total: 0, count: {}, score: 0 },
     rank: subject.rank,
     date: subject.air_date,

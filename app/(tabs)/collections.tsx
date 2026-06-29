@@ -4,7 +4,8 @@ import * as Clipboard from "expo-clipboard";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { getAllUserCollections, getCalendar } from "../../shared/api/client";
+import { getAllUserCollections, getCalendar, getEpisodes } from "../../shared/api/client";
+import { getAiringAt } from "../../shared/api/anilist";
 import type { CalendarItem, CollectionType, PagedResponse, UserCollection } from "../../shared/api/types";
 import { CollectionTypeLabel, SubjectTypeLabel } from "../../shared/api/types";
 import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
@@ -12,7 +13,10 @@ import { getDisplayLabel, getTodayBangumiWeekday, sortCollections } from "../../
 import {
   getPreferredSubjectCoverUrl,
   readCachedSubject,
+  readCachedValue,
   readCachedValueWithin,
+  readCachedValues,
+  readCachedValuesWithin,
   writeCachedSubjectPreviews,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
@@ -25,8 +29,16 @@ import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
+const AIRING_CACHE_PREFIX = "anilist-airing-";
+const EPISODES_CACHE_PREFIX = "episodes-";
+const AIRING_TIME_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 90;
+const AIRING_REQUEST_DELAY = 250;
+
 const EMPTY_AIRING_MAP = new Map<number, number>();
 const EMPTY_AIRING_TIME_MAP = new Map<number, { airingAt: number; episode: number }>();
+const EMPTY_EPISODE_MAP = new Map<number, number>();
+
+type AiringTime = { airingAt: number; episode: number };
 
 const COLLECTION_OPTIONS: Array<{ value: CollectionType; label: string }> = [
   { value: 3, label: "在看" },
@@ -36,32 +48,22 @@ const COLLECTION_OPTIONS: Array<{ value: CollectionType; label: string }> = [
   { value: 5, label: "抛弃" },
 ];
 
+const todayDateKey = (() => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+})();
+
 async function loadCollections(type: CollectionType, username: string, force = false) {
   const cacheKey = `collections-${type}-${username}`;
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
-    if (cached) {
-      await fillMissingTotalEpisodes(cached.data);
-      return cached;
-    }
+    if (cached) return cached;
   }
 
   const data = await getAllUserCollections({ username, type });
   await writeCachedValue(cacheKey, data);
   await writeCachedSubjectPreviews(data.data.map((collection) => collection.subject));
-  await fillMissingTotalEpisodes(data.data);
   return data;
-}
-
-async function fillMissingTotalEpisodes(collections: UserCollection[]) {
-  for (const collection of collections) {
-    const s = collection.subject;
-    if (!s.total_episodes && !s.eps) {
-      const cached = await readCachedSubject(s.id);
-      if (cached?.total_episodes) s.total_episodes = cached.total_episodes;
-      if (cached?.eps) s.eps = cached.eps;
-    }
-  }
 }
 
 async function loadCalendar(force = false) {
@@ -122,13 +124,222 @@ export default function CollectionsPage() {
 
   const airingMap = useMemo(() => getAiringMap(calendarQuery.data), [calendarQuery.data]);
   const today = getTodayBangumiWeekday();
-  const query = search.trim().toLowerCase();
+  const searchQuery = search.trim().toLowerCase();
 
+  const rawCollections = collectionsQuery.data?.data ?? [];
+  const isWatching = collectionType === 3;
+
+  // --- Phase 1: Backfill total_episodes from SQLite cache ---
+  const { data: totalEpBackfill } = useQuery({
+    queryKey: ["totalep-backfill", rawCollections.map((c) => c.subject_id).join(",")],
+    queryFn: async () => {
+      const totals = new Map<number, number>();
+      for (const c of rawCollections) {
+        const s = c.subject;
+        if (s.total_episodes == null && !s.eps) {  // Check for null or 0
+          const cached = await readCachedSubject(s.id);
+          if (cached?.total_episodes) totals.set(s.id, cached.total_episodes);
+          else if (cached?.eps) totals.set(s.id, cached.eps);
+        }
+      }
+      return totals;
+    },
+    enabled: rawCollections.length > 0,
+    staleTime: 0,
+  });
+
+  // --- Phase 2: Fetch episodes for subjects with missing total_episodes ---
+  const subjectsNeedingEpisodes = useMemo(() => {
+    return rawCollections
+      .filter((c) => {
+        const s = c.subject;
+        if (s.total_episodes != null && s.total_episodes > 0) return false;
+        if (s.eps > 0) return false;
+        return true;
+      })
+      .map((c) => c.subject_id);
+  }, [rawCollections]);
+
+  const { data: episodeTotals } = useQuery({
+    queryKey: ["episode-totals", subjectsNeedingEpisodes.join(",")],
+    queryFn: async () => {
+      if (subjectsNeedingEpisodes.length === 0) return new Map<number, number>();
+      const totals = new Map<number, number>();
+
+      // Batch fetch (10 at a time to avoid rate limiting)
+      for (let i = 0; i < subjectsNeedingEpisodes.length; i += 10) {
+        const batch = subjectsNeedingEpisodes.slice(i, i + 10);
+        const results = await Promise.allSettled(
+          batch.map((id) =>
+            getEpisodes(id).then((data) => {
+              const mainEps = data.data.filter((ep) => ep.type === 0);
+              return { id, totalEp: mainEps.length };
+            }),
+          ),
+        );
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            totals.set(result.value.id, result.value.totalEp);
+          }
+        }
+      }
+
+      return totals;
+    },
+    enabled: subjectsNeedingEpisodes.length > 0,
+    staleTime: CACHE_MAX_AGE,
+  });
+
+  // --- Phase 3: AniList airing times (only for watching tab) ---
+  const airingTimeTargets = useMemo(() => {
+    if (!isWatching || airingMap.size === 0) return [];
+    return rawCollections
+      .filter((item) => airingMap.has(item.subject_id))
+      .map((item) => ({
+        subjectId: item.subject_id,
+        name: item.subject.name,
+      }));
+  }, [rawCollections, airingMap, isWatching]);
+
+  const airingTimeTargetKey = airingTimeTargets.map((t) => t.subjectId).join(",");
+
+  const { data: airingTimeMapData } = useQuery({
+    queryKey: ["anilist-airing-times", airingTimeTargetKey],
+    queryFn: async () => {
+      const map = new Map<number, AiringTime>();
+      const cacheKeys = airingTimeTargets.map((t) => `${AIRING_CACHE_PREFIX}${t.subjectId}`);
+      const cachedByKey = await readCachedValuesWithin<AiringTime>(cacheKeys, AIRING_TIME_CACHE_MAX_AGE);
+      const staleByKey = await readCachedValues<AiringTime>(cacheKeys);
+
+      for (const target of airingTimeTargets) {
+        const key = `${AIRING_CACHE_PREFIX}${target.subjectId}`;
+        const cached = cachedByKey.get(key);
+        if (cached) { map.set(target.subjectId, cached); continue; }
+        const stale = staleByKey.get(key);
+        if (stale) map.set(target.subjectId, stale);
+      }
+
+      const missing = airingTimeTargets.filter((t) => !map.has(t.subjectId));
+      for (let i = 0; i < missing.length; i++) {
+        const target = missing[i];
+        if (!target.name) continue;
+        if (i > 0) await new Promise((r) => setTimeout(r, AIRING_REQUEST_DELAY));
+        const result = await getAiringAt(target.name);
+        if (result) {
+          await writeCachedValue(`${AIRING_CACHE_PREFIX}${target.subjectId}`, result);
+          map.set(target.subjectId, result);
+        }
+      }
+      return map;
+    },
+    enabled: airingTimeTargets.length > 0,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const airingTimeMap = airingTimeMapData ?? EMPTY_AIRING_TIME_MAP;
+
+  // --- Phase 4: Bangumi episode counts for airing subjects (airedEpMap for sorting) ---
+  const airingIds = useMemo(
+    () => rawCollections.filter((item) => airingMap.has(item.subject_id)).map((item) => item.subject_id),
+    [rawCollections, airingMap],
+  );
+
+  const { data: airedEpMap } = useQuery({
+    queryKey: ["aired-episodes", todayDateKey, airingIds.join(",")],
+    queryFn: async () => {
+      if (airingIds.length === 0) return EMPTY_EPISODE_MAP;
+      const map = new Map<number, number>();
+      const idsToFetch: number[] = [];
+
+      for (const id of airingIds) {
+        const cacheKey = `${EPISODES_CACHE_PREFIX}${id}`;
+        const cached = await readCachedValue<{ airedEp: number; checkedAt: number }>(cacheKey);
+        if (cached && Date.now() - cached.checkedAt <= CACHE_MAX_AGE) {
+          map.set(id, cached.airedEp);
+          continue;
+        }
+        idsToFetch.push(id);
+      }
+
+      if (idsToFetch.length > 0) {
+        const results = await Promise.allSettled(
+          idsToFetch.map((id) =>
+            getEpisodes(id).then((data) => {
+              const mainEps = data.data.filter((ep) => ep.type === 0);
+              const airedEp = mainEps.filter((ep) => ep.airdate && ep.airdate <= todayDateKey).length;
+              return { id, airedEp };
+            }),
+          ),
+        );
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            const { id, airedEp } = result.value;
+            map.set(id, airedEp);
+            await writeCachedValue(`${EPISODES_CACHE_PREFIX}${id}`, { airedEp, checkedAt: Date.now() });
+          }
+        }
+      }
+      return map;
+    },
+    enabled: isWatching && airingIds.length > 0,
+    staleTime: CACHE_MAX_AGE,
+  });
+
+  const episodeMap = airedEpMap ?? EMPTY_EPISODE_MAP;
+
+  // --- Merge all data sources ---
+  const enrichedCollections = useMemo(() => {
+    return rawCollections.map((c) => {
+      const src = c.subject;
+      const s = { ...src };
+
+      // Patch total_episodes from all available sources
+      // API returns eps as the primary total count; total_episodes may be null
+      if (s.total_episodes == null || s.total_episodes === 0) {
+        if (s.eps > 0) {
+          s.total_episodes = s.eps;
+        } else {
+        // Source 1: SQLite backfill (from detail page visits)
+        if (totalEpBackfill) {
+          const v = totalEpBackfill.get(s.id);
+          if (v) s.total_episodes = v;
+        }
+        // Source 2: fresh episode fetches
+        if ((s.total_episodes == null || s.total_episodes === 0) && episodeTotals) {
+          const v = episodeTotals.get(s.id);
+          if (v) s.total_episodes = v;
+        }
+        }
+      }
+
+      // Normalize rating: API returns null, convert to undefined for optional chaining
+      if (s.rating == null) {
+        (s as Record<string, unknown>).rating = undefined;
+      }
+
+      return { ...c, subject: s };
+    });
+  }, [rawCollections, totalEpBackfill, episodeTotals]);
+
+  // --- Sort with real data ---
   const collections = useMemo(() => {
-    const data = collectionsQuery.data?.data ?? [];
-    const sorted = sortCollections(data, calendarQuery.data ?? [], today, EMPTY_AIRING_MAP, EMPTY_AIRING_TIME_MAP);
-    return sorted.filter((collection) => matchesSearch(collection, query));
-  }, [calendarQuery.data, collectionsQuery.data?.data, query, today]);
+    const sorted = sortCollections(
+      enrichedCollections,
+      calendarQuery.data ?? [],
+      today,
+      episodeMap,
+      airingTimeMap,
+    );
+    return sorted.filter((c) => matchesSearch(c, searchQuery));
+  }, [enrichedCollections, calendarQuery.data, today, episodeMap, airingTimeMap, searchQuery]);
+
+  const displayLabelMap = useMemo(() => {
+    const map = new Map<number, string | null>();
+    for (const item of collections) {
+      map.set(item.subject_id, getDisplayLabel(item, airingMap, episodeMap, today, airingTimeMap));
+    }
+    return map;
+  }, [collections, airingMap, episodeMap, today, airingTimeMap]);
 
   async function refresh() {
     if (!username) return;
@@ -140,6 +351,10 @@ export default function CollectionsPage() {
       ]);
       queryClient.setQueryData(["collections", collectionType, username], nextCollections);
       queryClient.setQueryData(["calendar"], nextCalendar);
+      queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] });
+      queryClient.invalidateQueries({ queryKey: ["episode-totals"] });
+      queryClient.invalidateQueries({ queryKey: ["anilist-airing-times"] });
+      queryClient.invalidateQueries({ queryKey: ["aired-episodes"] });
     } catch (error) {
       Alert.alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
@@ -196,7 +411,7 @@ export default function CollectionsPage() {
             const subject = item.subject;
             const title = subject.name_cn || subject.name;
             const total = subject.total_episodes || subject.eps || 0;
-            const label = getDisplayLabel(item, airingMap, EMPTY_AIRING_MAP, today);
+            const label = isWatching ? displayLabelMap.get(item.subject_id) ?? undefined : undefined;
             return (
               <SubjectCard
                 title={title}
@@ -207,7 +422,7 @@ export default function CollectionsPage() {
                 meta={[
                   SubjectTypeLabel[subject.type] ?? "条目",
                   subject.date || "日期未知",
-                  subject.rating?.score ? `评分 ${subject.rating.score.toFixed(1)}` : "暂无评分",
+                  (subject.score ?? subject.rating?.score) ? `评分 ${(subject.score ?? subject.rating!.score).toFixed(1)}` : "暂无评分",
                 ]}
                 onPress={() => router.push(`/subject/${item.subject_id}`)}
                 onLongPress={() => void copyTitle(item)}

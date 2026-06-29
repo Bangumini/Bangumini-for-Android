@@ -1,10 +1,16 @@
 import { useMemo, useState } from "react";
 import { Alert, FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { searchAnimeSubject } from "../../shared/api/client";
 import { getNextSeason, getNextSeasonInfo, type NextSeasonItem } from "../../shared/api/anilist";
 import { WEEKDAY_CN } from "../../shared/sort-collections";
-import { readCachedValueWithin, writeCachedValue } from "../../shared/storage/sqlite-cache";
+import {
+  readCachedValue,
+  readCachedValueWithin,
+  writeCachedValue,
+} from "../../shared/storage/sqlite-cache";
 import { formatAiringTime } from "../../src/utils/date";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
@@ -12,6 +18,17 @@ import { SubjectCard } from "../../src/components/SubjectCard";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
+const MATCH_CACHE_TTL = 1000 * 60 * 60 * 24 * 30; // 30 days
+const MATCH_CONCURRENCY = 4;
+
+type BangumiMatch = { bangumiId: number | null; nameCn: string | null };
+
+interface SeasonEntry extends NextSeasonItem {
+  weekday: number | null;
+  nameCn: string | null;
+  bangumiId: number | null;
+}
+
 const SEGMENTS = [
   { value: "all", label: "全部" },
   ...[1, 2, 3, 4, 5, 6, 7].map((day) => ({
@@ -26,6 +43,58 @@ function cacheKey() {
   return `next-season-base-${info.seasonYear}-${info.season}`;
 }
 
+function matchCacheKey(anilistId: number) {
+  return `next-season-match-${anilistId}`;
+}
+
+function getWeekday(item: NextSeasonItem): number | null {
+  if (item.airingAt) {
+    const day = new Date(item.airingAt * 1000).getDay();
+    return day === 0 ? 7 : day;
+  }
+  const { year, month, day } = item.startDate;
+  if (!year || !month || !day) return null;
+  const jsDay = new Date(year, month - 1, day).getDay();
+  return jsDay === 0 ? 7 : jsDay;
+}
+
+function getStartDate(item: NextSeasonItem) {
+  const { year, month, day } = item.startDate;
+  if (!year || !month) return "日期未定";
+  return `${year}-${String(month).padStart(2, "0")}-${String(day ?? 1).padStart(2, "0")}`;
+}
+
+async function fetchBangumiMatch(item: NextSeasonItem): Promise<BangumiMatch> {
+  const result = await searchAnimeSubject(item.title.native);
+  return {
+    bangumiId: result?.id ?? null,
+    nameCn: result?.name_cn ?? null,
+  };
+}
+
+function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return Promise.resolve([]);
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (true) {
+      const idx = nextIndex;
+      if (idx >= items.length) return;
+      nextIndex += 1;
+      results[idx] = await worker(items[idx], idx);
+    }
+  }
+
+  return Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => runWorker()),
+  ).then(() => results);
+}
+
 async function loadNextSeason(force = false) {
   const key = cacheKey();
   if (!force) {
@@ -37,21 +106,52 @@ async function loadNextSeason(force = false) {
   return data;
 }
 
-function getWeekday(item: NextSeasonItem) {
-  if (item.airingAt) {
-    const day = new Date(item.airingAt * 1000).getDay();
-    return day === 0 ? 7 : day;
-  }
-  const { year, month, day } = item.startDate;
-  if (!year || !month || !day) return 0;
-  const jsDay = new Date(year, month - 1, day).getDay();
-  return jsDay === 0 ? 7 : jsDay;
-}
+async function resolveBangumiMatches(
+  items: NextSeasonItem[],
+  refresh: boolean,
+): Promise<{ entries: SeasonEntry[]; needsRefresh: boolean }> {
+  const cachedMatches = await Promise.all(
+    items.map((item) => readCachedValue<BangumiMatch>(matchCacheKey(item.id))),
+  );
 
-function getStartDate(item: NextSeasonItem) {
-  const { year, month, day } = item.startDate;
-  if (!year || !month) return "日期未定";
-  return `${year}-${String(month).padStart(2, "0")}-${String(day ?? 1).padStart(2, "0")}`;
+  const matches: Array<BangumiMatch | null> = new Array(items.length).fill(null);
+  const pending: Array<{ index: number; item: NextSeasonItem; fallback: BangumiMatch | null }> = [];
+  let needsRefresh = false;
+
+  for (let i = 0; i < items.length; i++) {
+    const cached = cachedMatches[i];
+    if (cached) {
+      matches[i] = cached;
+    } else {
+      needsRefresh = true;
+      if (refresh) pending.push({ index: i, item: items[i], fallback: null });
+    }
+  }
+
+  if (refresh && pending.length > 0) {
+    const refreshed = await mapWithConcurrency(pending, MATCH_CONCURRENCY, async ({ item, fallback }) => {
+      try {
+        const match = await fetchBangumiMatch(item);
+        await writeCachedValue(matchCacheKey(item.id), match);
+        return match;
+      } catch {
+        return fallback;
+      }
+    });
+    for (const [i, pendingItem] of pending.entries()) {
+      matches[pendingItem.index] = refreshed[i] ?? matches[pendingItem.index];
+    }
+    needsRefresh = false;
+  }
+
+  const entries: SeasonEntry[] = items.map((item, i) => ({
+    ...item,
+    weekday: getWeekday(item),
+    nameCn: matches[i]?.nameCn ?? null,
+    bangumiId: matches[i]?.bangumiId ?? null,
+  }));
+
+  return { entries, needsRefresh };
 }
 
 export default function NextSeasonPage() {
@@ -62,21 +162,27 @@ export default function NextSeasonPage() {
 
   const nextSeasonQuery = useQuery({
     queryKey: ["next-season", seasonInfo.seasonYear, seasonInfo.season],
-    queryFn: () => loadNextSeason(),
+    queryFn: async () => {
+      const items = await loadNextSeason();
+      const { entries } = await resolveBangumiMatches(items, true);
+      return entries;
+    },
   });
 
+  const allEntries = nextSeasonQuery.data ?? [];
+
   const items = useMemo(() => {
-    const data = nextSeasonQuery.data ?? [];
-    if (segment === "all") return data;
-    if (segment === "tba") return data.filter((item) => getWeekday(item) === 0);
-    return data.filter((item) => getWeekday(item) === Number(segment));
-  }, [nextSeasonQuery.data, segment]);
+    if (segment === "all") return allEntries;
+    if (segment === "tba") return allEntries.filter((item) => !item.weekday);
+    return allEntries.filter((item) => item.weekday === Number(segment));
+  }, [allEntries, segment]);
 
   async function refresh() {
     setRefreshing(true);
     try {
-      const next = await loadNextSeason(true);
-      queryClient.setQueryData(["next-season", seasonInfo.seasonYear, seasonInfo.season], next);
+      const baseItems = await loadNextSeason(true);
+      const { entries } = await resolveBangumiMatches(baseItems, true);
+      queryClient.setQueryData(["next-season", seasonInfo.seasonYear, seasonInfo.season], entries);
     } catch (error) {
       Alert.alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
@@ -84,8 +190,12 @@ export default function NextSeasonPage() {
     }
   }
 
-  function openAniList(id: number) {
-    void Linking.openURL(`https://anilist.co/anime/${id}`);
+  function openItem(item: SeasonEntry) {
+    if (item.bangumiId) {
+      router.push(`/subject/${item.bangumiId}`);
+    } else {
+      void Linking.openURL(`https://anilist.co/anime/${item.id}`);
+    }
   }
 
   return (
@@ -117,17 +227,17 @@ export default function NextSeasonPage() {
           ListEmptyComponent={<EmptyState title="该分组暂无条目" />}
           renderItem={({ item }) => (
             <SubjectCard
-              title={item.title.native || item.title.romaji}
+              title={item.nameCn ?? item.title.native}
               subtitle={item.title.romaji}
-              coverUrl={item.cover}
-              label={getWeekday(item) ? WEEKDAY_CN[getWeekday(item)].replace("星期", "周") : "TBA"}
+              coverUrl={item.cover?.replace(/^http:/, "https:")}
+              label={item.weekday ? WEEKDAY_CN[item.weekday].replace("星期", "周") : "TBA"}
               meta={[
                 item.format,
                 getStartDate(item),
                 item.airingAt ? formatAiringTime(item.airingAt) : "播出时间未定",
               ]}
               progress={item.episodes ? `预计 ${item.episodes} 集` : null}
-              onPress={() => openAniList(item.id)}
+              onPress={() => openItem(item)}
             />
           )}
         />

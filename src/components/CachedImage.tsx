@@ -14,12 +14,14 @@ export default function CachedImage({ uri, style, contentFit = "cover" }: Cached
     return <View style={[{ backgroundColor: colors.surfaceAlt }, style]} />;
   }
 
+  const safeUri = uri.replace(/^http:/, "https:");
+
   return (
     <Image
-      source={{ uri }}
+      source={{ uri: safeUri }}
       style={style as StyleProp<ImageStyle>}
       contentFit={contentFit}
-      cachePolicy="disk"
+      cachePolicy="memory-disk"
       transition={160}
     />
   );

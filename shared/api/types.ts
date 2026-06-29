@@ -41,6 +41,8 @@ export interface Subject {
   eps: number;
   total_episodes: number;
   rating: Rating;
+  /** Bangumi API returns this flat field instead of rating.score */
+  score?: number;
   rank: number;
   date: string;
   air_weekday?: number;

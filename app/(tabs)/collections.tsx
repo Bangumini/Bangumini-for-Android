@@ -12,11 +12,13 @@ import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import { getDisplayLabel, getTodayBangumiWeekday, sortCollections } from "../../shared/sort-collections";
 import {
   getPreferredSubjectCoverUrl,
+  readCachedCollection,
   readCachedSubject,
   readCachedValue,
   readCachedValueWithin,
   readCachedValues,
   readCachedValuesWithin,
+  writeCachedCollection,
   writeCachedSubject,
   writeCachedSubjectPreviews,
   writeCachedValue,
@@ -57,14 +59,23 @@ async function loadCollections(type: CollectionType, username: string, force = f
   const cacheKey = `collections-${type}-${username}`;
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
-    if (cached) return cached;
+    if (cached) {
+      // Merge fresher individual collection data from subject_collections
+      await mergeSubjectCollections(cached, username);
+      return cached;
+    }
     // Cache miss or expired — try stale cache before hitting network
     const stale = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
     if (stale) {
+      // Merge fresher individual collection data from subject_collections
+      await mergeSubjectCollections(stale, username);
       // Return stale cache immediately, refresh in background
       getAllUserCollections({ username, type }).then((data) => {
         writeCachedValue(cacheKey, data);
         writeCachedSubjectPreviews(data.data.map((c) => c.subject));
+        Promise.allSettled(
+          data.data.map((c) => writeCachedCollection(username, c)),
+        ).catch(() => {});
       }).catch(() => {});
       return stale;
     }
@@ -73,7 +84,28 @@ async function loadCollections(type: CollectionType, username: string, force = f
   const data = await getAllUserCollections({ username, type });
   await writeCachedValue(cacheKey, data);
   await writeCachedSubjectPreviews(data.data.map((collection) => collection.subject));
+  // Persist individual collections to subject_collections so detail page
+  // can read ep_status offline even for entries never opened in detail
+  Promise.allSettled(
+    data.data.map((c) => writeCachedCollection(username, c)),
+  ).catch(() => {});
   return data;
+}
+
+async function mergeSubjectCollections(data: PagedResponse<UserCollection>, username: string) {
+  // Read subject_collections in parallel to merge fresher ep_status/type
+  const updates = await Promise.allSettled(
+    data.data.map((c) => readCachedCollection(username, c.subject_id)),
+  );
+  for (let i = 0; i < data.data.length; i++) {
+    const result = updates[i];
+    if (result.status === "fulfilled" && result.value) {
+      const fresh = result.value;
+      data.data[i].ep_status = fresh.ep_status;
+      data.data[i].type = fresh.type;
+      data.data[i].rate = fresh.rate;
+    }
+  }
 }
 
 async function loadCalendar(force = false) {

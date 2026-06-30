@@ -18,6 +18,7 @@ import {
   deleteCachedCollection,
   getPreferredSubjectCoverUrl,
   readCachedCharactersWithin,
+  readCachedCollection,
   readCachedCollectionWithin,
   readCachedEpisodesWithin,
   readCachedPersonsWithin,
@@ -66,6 +67,9 @@ async function loadCollection(username: string, subjectId: number, force = false
   if (!force) {
     const cached = await readCachedCollectionWithin(username, subjectId, DETAIL_CACHE_MAX_AGE);
     if (cached) return cached;
+    // Stale cache fallback — individual collection data persists up to CACHE_TTL_MS (100 days)
+    const stale = await readCachedCollection(username, subjectId);
+    if (stale) return stale;
   }
 
   try {

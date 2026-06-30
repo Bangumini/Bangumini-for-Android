@@ -289,7 +289,7 @@ export default function SubjectDetailPage() {
           {subject.name_cn ? <Text style={styles.subtitle}>{subject.name}</Text> : null}
           <View style={styles.metaGrid}>
             <Text style={styles.meta}>评分 {subject.rating?.score ? subject.rating.score.toFixed(1) : "暂无"}</Text>
-            <Text style={styles.meta}>{subject.rating?.rank ? `排名 #${subject.rating.rank}` : "暂无排名"}</Text>
+            <Text style={styles.meta}>{subject.rank || subject.rating?.rank ? `排名 #${subject.rank || subject.rating?.rank}` : "暂无排名"}</Text>
             <Text style={styles.meta}>{subject.date || "日期未知"}</Text>
             {getAirWeekdayLabel(subject.air_weekday) ? (
               <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday)}</Text>

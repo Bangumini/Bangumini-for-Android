@@ -327,7 +327,7 @@ function subjectFromSmall(subject: SubjectSmall): Subject {
     summary: subject.summary,
     eps: (subject as unknown as { eps?: number }).eps ?? 0,
     total_episodes: (subject as unknown as { total_episodes?: number }).total_episodes ?? 0,
-    rating: subject.rating ?? { total: 0, count: {}, score: 0, rank: 0 },
+    rating: subject.rating ?? undefined,
     rank: subject.rank,
     date: subject.air_date,
     air_weekday: subject.air_weekday,

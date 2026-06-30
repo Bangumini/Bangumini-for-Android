@@ -123,6 +123,7 @@ function mergeSubjectFull(current: Subject | null, incoming: Subject): Subject {
   return {
     ...incoming,
     images: mergeSubjectImages(current.images, incoming.images),
+    summary: incoming.summary || current.summary,
     rating: incoming.rating?.total ? incoming.rating : current.rating,
     rank: incoming.rank || current.rank,
     air_weekday: incoming.air_weekday ?? current.air_weekday,
@@ -324,7 +325,7 @@ function subjectFromSmall(subject: SubjectSmall): Subject {
     name_cn: subject.name_cn,
     type: subject.type,
     images: subject.images,
-    summary: subject.summary,
+    summary: subject.summary || (subject as unknown as { short_summary?: string }).short_summary || "",
     eps: (subject as unknown as { eps?: number }).eps ?? 0,
     total_episodes: (subject as unknown as { total_episodes?: number }).total_episodes ?? 0,
     rating: subject.rating ?? undefined,

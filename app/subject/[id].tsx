@@ -1,5 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import * as Clipboard from "expo-clipboard";
+
+function CopyText({ text, style, children }: { text: string; style?: object; children?: React.ReactNode }) {
+  return (
+    <Pressable
+      onLongPress={() => {
+        void Clipboard.setStringAsync(text).then(() => {
+          Alert.alert("已复制", text);
+        });
+      }}
+      delayLongPress={400}
+    >
+      {children ?? <Text style={style}>{text}</Text>}
+    </Pressable>
+  );
+}
 import { router, useLocalSearchParams } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -46,11 +62,25 @@ function isNotFoundError(error: unknown) {
 async function loadSubject(subjectId: number, force = false) {
   if (!force) {
     const cached = await readCachedSubjectDeepWithin(subjectId, DETAIL_CACHE_MAX_AGE);
-    if (cached) return cached;
+    // Only trust cache if it has meaningful content (summary present)
+    if (cached && cached.summary) return cached;
+    // Incomplete cache (e.g. summary missing from SlimSubject conversion) —
+    // try network first, fall back to stale cache on failure
+    if (cached) {
+      try {
+        const subject = await getSubject(subjectId);
+        return finalizeSubjectWrite(subjectId, subject);
+      } catch {
+        return cached;
+      }
+    }
   }
 
   const subject = await getSubject(subjectId);
+  return finalizeSubjectWrite(subjectId, subject);
+}
 
+async function finalizeSubjectWrite(subjectId: number, subject: Subject) {
   // air_weekday is not returned by /v0/subjects/{id}, but the calendar API
   // (loaded on the collections page) writes it to the SQLite subject cache.
   // Backfill from cache so the merge in writeCachedSubject preserves it.
@@ -58,7 +88,6 @@ async function loadSubject(subjectId: number, force = false) {
     const cached = await readCachedSubject(subjectId);
     if (cached?.air_weekday != null) subject.air_weekday = cached.air_weekday;
   }
-
   return writeCachedSubject(subject);
 }
 
@@ -126,6 +155,27 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+const SUMMARY_ORIGINAL_MARKER = "[简介原文]";
+
+type SummaryBlock = { type: "paragraph" | "heading"; text: string };
+
+function getSummaryBlocks(summary: string): SummaryBlock[] {
+  const blocks: SummaryBlock[] = [];
+  for (const rawParagraph of summary.split(/\n\s*\n/)) {
+    const paragraph = rawParagraph.trim();
+    if (!paragraph) continue;
+    const parts = paragraph.split(SUMMARY_ORIGINAL_MARKER);
+    parts.forEach((part, index) => {
+      const text = part.trim();
+      if (text) blocks.push({ type: "paragraph", text });
+      if (index < parts.length - 1) {
+        blocks.push({ type: "heading", text: "简介原文" });
+      }
+    });
+  }
+  return blocks;
+}
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <View style={styles.section}>
@@ -142,6 +192,20 @@ export default function SubjectDetailPage() {
   const { loggedIn, username, checking } = useAuth();
   const [targetEp, setTargetEp] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        subjectQuery.refetch(),
+        episodesQuery.refetch(),
+        collectionQuery.refetch(),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   const subjectQuery = useQuery({
     queryKey: ["subject", subjectId],
@@ -187,7 +251,7 @@ export default function SubjectDetailPage() {
   }, [collection?.ep_status, subjectId]);
 
   const summaryBlocks = useMemo(
-    () => subject?.summary?.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean) ?? [],
+    () => (subject?.summary ? getSummaryBlocks(subject.summary) : []),
     [subject?.summary],
   );
 
@@ -281,18 +345,36 @@ export default function SubjectDetailPage() {
   }
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+    <ScrollView style={styles.screen} contentContainerStyle={styles.content}
+      refreshControl={
+        <RefreshControl refreshing={refreshing} onRefresh={handleRefresh}
+          tintColor={colors.primary} colors={[colors.primary]} />
+      }>
       <View style={styles.hero}>
         <CachedImage uri={getPreferredSubjectCoverUrl(subject)} style={styles.cover} contentFit="cover" />
         <View style={styles.heroInfo}>
-          <Text style={styles.title}>{subject.name_cn || subject.name}</Text>
-          {subject.name_cn ? <Text style={styles.subtitle}>{subject.name}</Text> : null}
+          <CopyText text={subject.name_cn || subject.name}>
+            <Text style={styles.title}>{subject.name_cn || subject.name}</Text>
+          </CopyText>
+          {subject.name_cn ? (
+            <CopyText text={subject.name}>
+              <Text style={styles.subtitle}>{subject.name}</Text>
+            </CopyText>
+          ) : null}
           <View style={styles.metaGrid}>
-            <Text style={styles.meta}>评分 {subject.rating?.score ? subject.rating.score.toFixed(1) : "暂无"}</Text>
-            <Text style={styles.meta}>{subject.rank || subject.rating?.rank ? `排名 #${subject.rank || subject.rating?.rank}` : "暂无排名"}</Text>
-            <Text style={styles.meta}>{subject.date || "日期未知"}</Text>
+            <CopyText text={`评分 ${subject.rating?.score ? subject.rating.score.toFixed(1) : "暂无"}`}>
+              <Text style={styles.meta}>评分 {subject.rating?.score ? subject.rating.score.toFixed(1) : "暂无"}</Text>
+            </CopyText>
+            <CopyText text={`排名 #${subject.rank || subject.rating?.rank}`}>
+              <Text style={styles.meta}>{subject.rank || subject.rating?.rank ? `排名 #${subject.rank || subject.rating?.rank}` : "暂无排名"}</Text>
+            </CopyText>
+            <CopyText text={subject.date || "日期未知"}>
+              <Text style={styles.meta}>{subject.date || "日期未知"}</Text>
+            </CopyText>
             {getAirWeekdayLabel(subject.air_weekday) ? (
-              <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday)}</Text>
+              <CopyText text={getAirWeekdayLabel(subject.air_weekday)!}>
+                <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday)}</Text>
+              </CopyText>
             ) : null}
           </View>
         </View>
@@ -354,9 +436,15 @@ export default function SubjectDetailPage() {
 
       <Section title="简介">
         {summaryBlocks.length ? (
-          summaryBlocks.map((block, index) => (
-            <Text key={`${index}-${block.slice(0, 12)}`} style={styles.paragraph}>{block}</Text>
-          ))
+          summaryBlocks.map((block, index) =>
+            block.type === "heading" ? (
+              <Text key={`heading-${index}`} style={[styles.sectionTitle, { marginTop: index > 0 ? 12 : 0 }]}>{block.text}</Text>
+            ) : (
+              <CopyText key={`para-${index}`} text={block.text}>
+                <Text style={styles.paragraph}>{block.text}</Text>
+              </CopyText>
+            )
+          )
         ) : (
           <Text style={styles.muted}>暂无简介</Text>
         )}
@@ -364,18 +452,22 @@ export default function SubjectDetailPage() {
 
       <Section title="Staff">
         {personsQuery.data?.slice(0, 16).map((person: RelatedPerson) => (
-          <Text key={`${person.id}-${person.relation}`} style={styles.line}>
-            {person.relation} · {person.name}
-          </Text>
+          <CopyText key={`${person.id}-${person.relation}`} text={person.name}>
+            <Text style={styles.line}>
+              {person.relation} · {person.name}
+            </Text>
+          </CopyText>
         )) ?? <Text style={styles.muted}>加载中</Text>}
       </Section>
 
       <Section title="角色 / Cast">
         {charactersQuery.data?.slice(0, 16).map((character: RelatedCharacter) => (
-          <Text key={`${character.id}-${character.relation}`} style={styles.line}>
-            {character.relation} · {character.name}
-            {character.actors?.[0]?.name ? ` / ${character.actors[0].name}` : ""}
-          </Text>
+          <CopyText key={`${character.id}-${character.relation}`} text={character.name}>
+            <Text style={styles.line}>
+              {character.relation} · {character.name}
+              {character.actors?.[0]?.name ? ` / ${character.actors[0].name}` : ""}
+            </Text>
+          </CopyText>
         )) ?? <Text style={styles.muted}>加载中</Text>}
       </Section>
 

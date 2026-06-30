@@ -1,5 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, FlatList, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withSpring,
+  withTiming,
+} from "react-native-reanimated";
 import * as Clipboard from "expo-clipboard";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -35,6 +44,7 @@ const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const AIRING_CACHE_PREFIX = "anilist-airing-";
 const EPISODES_CACHE_PREFIX = "episodes-";
 const AIRING_TIME_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 90;
+const PAGE_SIZE = 20;
 
 const EMPTY_AIRING_MAP = new Map<number, number>();
 const EMPTY_AIRING_TIME_MAP = new Map<number, { airingAt: number; episode: number }>();
@@ -156,6 +166,56 @@ export default function CollectionsPage() {
   const [collectionType, setCollectionType] = useState<CollectionType>(3);
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
+
+  // --- Pagination: animated swipe between pages ---
+  const translateX = useSharedValue(0);
+  const fadeAnim = useSharedValue(1);
+  const currentPageSV = useSharedValue(1);
+  const totalPagesSV = useSharedValue(1);
+
+  const goToPrevPage = useCallback(() => {
+    setPage((p) => Math.max(1, p - 1));
+  }, []);
+
+  const goToNextPage = useCallback(() => {
+    setPage((p) => p + 1); // clamped by useEffect below
+  }, []);
+
+  const panGesture = Gesture.Pan()
+    .activeOffsetX([-10, 10])
+    .failOffsetY([-10, 10])
+    .onUpdate((e) => {
+      translateX.value = e.translationX;
+    })
+    .onEnd((e) => {
+      "worklet";
+      const threshold = 40;
+      if (e.translationX > threshold && currentPageSV.value > 1) {
+        translateX.value = withTiming(0, { duration: 180 });
+        fadeAnim.value = withSequence(
+          withTiming(0, { duration: 80 }),
+          withTiming(1, { duration: 120 }),
+        );
+        currentPageSV.value -= 1;
+        runOnJS(goToPrevPage)();
+      } else if (e.translationX < -threshold && currentPageSV.value < totalPagesSV.value) {
+        translateX.value = withTiming(0, { duration: 180 });
+        fadeAnim.value = withSequence(
+          withTiming(0, { duration: 80 }),
+          withTiming(1, { duration: 120 }),
+        );
+        currentPageSV.value += 1;
+        runOnJS(goToNextPage)();
+      } else {
+        translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
+      }
+    });
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+    opacity: fadeAnim.value,
+  }));
 
   useEffect(() => {
     if (!checking && !loggedIn) router.replace("/login");
@@ -424,6 +484,27 @@ export default function CollectionsPage() {
     return map;
   }, [collections, airingMap, episodeMap, today, airingTimeMap]);
 
+  // --- Pagination ---
+  const totalPages = Math.max(1, Math.ceil(collections.length / PAGE_SIZE));
+  const paged = useMemo(
+    () => collections.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [collections, page],
+  );
+
+  // Keep shared values in sync for worklet access
+  useEffect(() => { currentPageSV.value = page; }, [page, currentPageSV]);
+  useEffect(() => { totalPagesSV.value = totalPages; }, [totalPages, totalPagesSV]);
+
+  // Reset page when collection type or search changes
+  useEffect(() => {
+    setPage(1);
+  }, [collectionType, searchQuery]);
+
+  // Clamp page when totalPages shrinks
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [totalPages, page]);
+
   async function refresh() {
     if (!username) return;
     setRefreshing(true);
@@ -471,48 +552,59 @@ export default function CollectionsPage() {
           onRetry={() => void collectionsQuery.refetch()}
         />
       ) : (
-        <FlatList
-          data={collections}
-          keyExtractor={(item) => String(item.subject_id)}
-          contentContainerStyle={collections.length ? styles.list : styles.emptyList}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={refresh}
-              tintColor={colors.primary}
-              colors={[colors.primary]}
-            />
-          }
-          ListHeaderComponent={
-            <Text style={styles.count}>
-              {CollectionTypeLabel[collectionType]} · {collections.length} / {collectionsQuery.data?.total ?? 0}
-            </Text>
-          }
-          ItemSeparatorComponent={() => <View style={styles.separator} />}
-          ListEmptyComponent={<EmptyState title="没有匹配条目" detail="调整搜索词或切换收藏类型" />}
-          renderItem={({ item }) => {
-            const subject = item.subject;
-            const title = subject.name_cn || subject.name;
-            const total = subject.total_episodes || subject.eps || 0;
-            const label = isWatching ? displayLabelMap.get(item.subject_id) ?? undefined : undefined;
-            return (
-              <SubjectCard
-                title={title}
-                subtitle={subject.name}
-                coverUrl={getPreferredSubjectCoverUrl(subject)}
-                label={label}
-                progress={`${item.ep_status}/${total || "?"} 集`}
-                meta={[
-                  SubjectTypeLabel[subject.type] ?? "条目",
-                  subject.date || "日期未知",
-                  (subject.score ?? subject.rating?.score) ? `评分 ${(subject.score ?? subject.rating!.score).toFixed(1)}` : "暂无评分",
-                ]}
-                onPress={() => router.push(`/subject/${item.subject_id}`)}
-                onLongPress={() => void copyTitle(item)}
+        <GestureDetector gesture={panGesture}>
+          <Animated.View style={[animatedStyle, { flex: 1 }]}>
+            <FlatList
+              data={paged}
+              keyExtractor={(item) => String(item.subject_id)}
+              contentContainerStyle={paged.length ? styles.list : styles.emptyList}
+              refreshControl={
+                <RefreshControl
+                  refreshing={refreshing}
+                  onRefresh={refresh}
+                  tintColor={colors.primary}
+                  colors={[colors.primary]}
+                />
+              }
+              ListHeaderComponent={
+                <View style={styles.headerRow}>
+                  <Text style={styles.count}>
+                    {CollectionTypeLabel[collectionType]} · {collections.length} / {collectionsQuery.data?.total ?? 0}
+                  </Text>
+                  {collections.length > 0 && (
+                    <Text style={styles.pageInfo}>
+                      第 {page} / {totalPages} 页 · 共 {collections.length} 条
+                    </Text>
+                  )}
+                </View>
+              }
+                ItemSeparatorComponent={() => <View style={styles.separator} />}
+                ListEmptyComponent={<EmptyState title="没有匹配条目" detail="调整搜索词或切换收藏类型" />}
+                renderItem={({ item }) => {
+                  const subject = item.subject;
+                  const title = subject.name_cn || subject.name;
+                  const total = subject.total_episodes || subject.eps || 0;
+                  const label = isWatching ? displayLabelMap.get(item.subject_id) ?? undefined : undefined;
+                  return (
+                    <SubjectCard
+                      title={title}
+                      subtitle={subject.name}
+                      coverUrl={getPreferredSubjectCoverUrl(subject)}
+                      label={label}
+                      progress={`${item.ep_status}/${total || "?"} 集`}
+                      meta={[
+                        SubjectTypeLabel[subject.type] ?? "条目",
+                        subject.date || "日期未知",
+                        (subject.score ?? subject.rating?.score) ? `评分 ${(subject.score ?? subject.rating!.score).toFixed(1)}` : "暂无评分",
+                      ]}
+                      onPress={() => router.push(`/subject/${item.subject_id}`)}
+                      onLongPress={() => void copyTitle(item)}
+                    />
+                  );
+                }}
               />
-            );
-          }}
-        />
+            </Animated.View>
+          </GestureDetector>
       )}
     </View>
   );
@@ -536,7 +628,18 @@ const styles = StyleSheet.create({
     height: 10,
   },
   count: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
     marginBottom: 10,
+    paddingHorizontal: 1,
+  },
+  pageInfo: {
     color: colors.muted,
     fontSize: 13,
     fontWeight: "600",

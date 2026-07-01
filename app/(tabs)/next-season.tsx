@@ -1,25 +1,36 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withSpring,
+  withTiming,
+} from "react-native-reanimated";
 
 import { searchAnimeSubject } from "../../shared/api/client";
 import { getNextSeason, getNextSeasonInfo, type NextSeasonItem } from "../../shared/api/anilist";
 import { WEEKDAY_CN } from "../../shared/sort-collections";
+import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import {
   readCachedValue,
   readCachedValueWithin,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
 import { formatAiringTime } from "../../src/utils/date";
+import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
-const MATCH_CACHE_TTL = 1000 * 60 * 60 * 24 * 30; // 30 days
 const MATCH_CONCURRENCY = 4;
+const PAGE_SIZE = 20;
 
 type BangumiMatch = { bangumiId: number | null; nameCn: string | null };
 
@@ -62,6 +73,17 @@ function getStartDate(item: NextSeasonItem) {
   const { year, month, day } = item.startDate;
   if (!year || !month) return "日期未定";
   return `${year}-${String(month).padStart(2, "0")}-${String(day ?? 1).padStart(2, "0")}`;
+}
+
+function matchesSearch(item: SeasonEntry, query: string) {
+  if (!query) return true;
+  const haystack = [
+    item.title.native,
+    item.title.romaji,
+    item.nameCn ?? "",
+    ...buildSubjectKeywords(item.nameCn ?? undefined, item.title.native),
+  ].join(" ").toLowerCase();
+  return haystack.includes(query);
 }
 
 async function fetchBangumiMatch(item: NextSeasonItem): Promise<BangumiMatch> {
@@ -162,16 +184,64 @@ async function resolveBangumiMatches(
 export default function NextSeasonPage() {
   const queryClient = useQueryClient();
   const [segment, setSegment] = useState("all");
+  const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
   const seasonInfo = getNextSeasonInfo();
+
+  const translateX = useSharedValue(0);
+  const fadeAnim = useSharedValue(1);
+  const currentPageSV = useSharedValue(1);
+  const totalPagesSV = useSharedValue(1);
+
+  const goToPrevPage = useCallback(() => {
+    setPage((p) => Math.max(1, p - 1));
+  }, []);
+
+  const goToNextPage = useCallback(() => {
+    setPage((p) => p + 1);
+  }, []);
+
+  const panGesture = Gesture.Pan()
+    .activeOffsetX([-10, 10])
+    .failOffsetY([-10, 10])
+    .onUpdate((e) => {
+      translateX.value = e.translationX;
+    })
+    .onEnd((e) => {
+      "worklet";
+      const threshold = 40;
+      if (e.translationX > threshold && currentPageSV.value > 1) {
+        translateX.value = withTiming(0, { duration: 180 });
+        fadeAnim.value = withSequence(
+          withTiming(0, { duration: 80 }),
+          withTiming(1, { duration: 120 }),
+        );
+        currentPageSV.value -= 1;
+        runOnJS(goToPrevPage)();
+      } else if (e.translationX < -threshold && currentPageSV.value < totalPagesSV.value) {
+        translateX.value = withTiming(0, { duration: 180 });
+        fadeAnim.value = withSequence(
+          withTiming(0, { duration: 80 }),
+          withTiming(1, { duration: 120 }),
+        );
+        currentPageSV.value += 1;
+        runOnJS(goToNextPage)();
+      } else {
+        translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
+      }
+    });
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+    opacity: fadeAnim.value,
+  }));
 
   const nextSeasonQuery = useQuery({
     queryKey: ["next-season", seasonInfo.seasonYear, seasonInfo.season],
     queryFn: async () => {
       const items = await loadNextSeason();
-      // Use cached matches first (refresh=false), background refresh later
       const { entries, needsRefresh } = await resolveBangumiMatches(items, false);
-      // If some matches are missing and we're online, try to fetch them
       if (needsRefresh) {
         resolveBangumiMatches(items, true).then((refreshed) => {
           queryClient.setQueryData(
@@ -187,12 +257,38 @@ export default function NextSeasonPage() {
   });
 
   const allEntries = nextSeasonQuery.data ?? [];
+  const searchQuery = search.trim().toLowerCase();
 
   const items = useMemo(() => {
-    if (segment === "all") return allEntries;
-    if (segment === "tba") return allEntries.filter((item) => !item.weekday);
-    return allEntries.filter((item) => item.weekday === Number(segment));
-  }, [allEntries, segment]);
+    let filtered: SeasonEntry[];
+    if (segment === "all") {
+      filtered = allEntries;
+    } else if (segment === "tba") {
+      filtered = allEntries.filter((item) => !item.weekday);
+    } else {
+      filtered = allEntries.filter((item) => item.weekday === Number(segment));
+    }
+
+    if (!searchQuery) return filtered;
+    return filtered.filter((item) => matchesSearch(item, searchQuery));
+  }, [allEntries, segment, searchQuery]);
+
+  const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const paged = useMemo(
+    () => items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [items, page],
+  );
+
+  useEffect(() => { currentPageSV.value = page; }, [page, currentPageSV]);
+  useEffect(() => { totalPagesSV.value = totalPages; }, [totalPages, totalPagesSV]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [segment, searchQuery]);
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [totalPages, page]);
 
   async function refresh() {
     setRefreshing(true);
@@ -215,10 +311,13 @@ export default function NextSeasonPage() {
     }
   }
 
+  const currentSegmentLabel = SEGMENTS.find((s) => s.value === segment)?.label ?? "全部";
+
   return (
     <View style={styles.screen}>
       <Text style={styles.heading}>{seasonInfo.label}</Text>
       <SegmentedControl options={SEGMENTS} value={segment} onChange={setSegment} />
+      <SearchInput value={search} onChangeText={setSearch} placeholder={`搜索${currentSegmentLabel}`} />
 
       {nextSeasonQuery.isLoading ? (
         <LoadingState label="加载下季度新番" />
@@ -228,36 +327,52 @@ export default function NextSeasonPage() {
           onRetry={() => void nextSeasonQuery.refetch()}
         />
       ) : (
-        <FlatList
-          data={items}
-          keyExtractor={(item) => String(item.id)}
-          contentContainerStyle={items.length ? styles.list : styles.emptyList}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={refresh}
-              tintColor={colors.primary}
-              colors={[colors.primary]}
+        <GestureDetector gesture={panGesture}>
+          <Animated.View style={[animatedStyle, { flex: 1 }]}>
+            <FlatList
+              data={paged}
+              keyExtractor={(item) => String(item.id)}
+              contentContainerStyle={paged.length ? styles.list : styles.emptyList}
+              refreshControl={
+                <RefreshControl
+                  refreshing={refreshing}
+                  onRefresh={refresh}
+                  tintColor={colors.primary}
+                  colors={[colors.primary]}
+                />
+              }
+              ListHeaderComponent={
+                <View style={styles.headerRow}>
+                  <Text style={styles.count}>
+                    {currentSegmentLabel} · {items.length}
+                  </Text>
+                  {items.length > 0 && (
+                    <Text style={styles.pageInfo}>
+                      第 {page} / {totalPages} 页 · 共 {items.length} 条
+                    </Text>
+                  )}
+                </View>
+              }
+              ItemSeparatorComponent={() => <View style={styles.separator} />}
+              ListEmptyComponent={<EmptyState title="没有匹配条目" detail="调整搜索词或切换分组" />}
+              renderItem={({ item }) => (
+                <SubjectCard
+                  title={item.nameCn ?? item.title.native}
+                  subtitle={item.title.romaji}
+                  coverUrl={item.cover?.replace(/^http:/, "https:")}
+                  label={item.weekday ? WEEKDAY_CN[item.weekday].replace("星期", "周") : "TBA"}
+                  meta={[
+                    item.format,
+                    getStartDate(item),
+                    item.airingAt ? formatAiringTime(item.airingAt) : "播出时间未定",
+                  ]}
+                  progress={item.episodes ? `预计 ${item.episodes} 集` : null}
+                  onPress={() => openItem(item)}
+                />
+              )}
             />
-          }
-          ItemSeparatorComponent={() => <View style={styles.separator} />}
-          ListEmptyComponent={<EmptyState title="该分组暂无条目" />}
-          renderItem={({ item }) => (
-            <SubjectCard
-              title={item.nameCn ?? item.title.native}
-              subtitle={item.title.romaji}
-              coverUrl={item.cover?.replace(/^http:/, "https:")}
-              label={item.weekday ? WEEKDAY_CN[item.weekday].replace("星期", "周") : "TBA"}
-              meta={[
-                item.format,
-                getStartDate(item),
-                item.airingAt ? formatAiringTime(item.airingAt) : "播出时间未定",
-              ]}
-              progress={item.episodes ? `预计 ${item.episodes} 集` : null}
-              onPress={() => openItem(item)}
-            />
-          )}
-        />
+          </Animated.View>
+        </GestureDetector>
       )}
     </View>
   );
@@ -274,6 +389,23 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 20,
     fontWeight: "800",
+  },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+    paddingHorizontal: 1,
+  },
+  count: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  pageInfo: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: "600",
   },
   list: {
     padding: 16,

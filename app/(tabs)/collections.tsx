@@ -261,7 +261,6 @@ export default function CollectionsPage() {
       .filter((c) => {
         const s = c.subject;
         if (s.total_episodes != null && s.total_episodes > 0) return false;
-        if (s.eps > 0) return false;
         return true;
       })
       .map((c) => c.subject_id);
@@ -433,21 +432,21 @@ export default function CollectionsPage() {
       const s = { ...src };
 
       // Patch total_episodes from all available sources
-      // API returns eps as the primary total count; total_episodes may be null
+      // Prefer actual episode counts over declared counts (eps can be inaccurate)
       if (s.total_episodes == null || s.total_episodes === 0) {
-        if (s.eps > 0) {
-          s.total_episodes = s.eps;
-        } else {
-        // Source 1: SQLite backfill (from detail page visits)
-        if (totalEpBackfill) {
-          const v = totalEpBackfill.get(s.id);
-          if (v) s.total_episodes = v;
-        }
-        // Source 2: fresh episode fetches
-        if ((s.total_episodes == null || s.total_episodes === 0) && episodeTotals) {
+        // Source 1: fresh episode fetches (most reliable — counts actual type-0 episodes)
+        if (episodeTotals) {
           const v = episodeTotals.get(s.id);
           if (v) s.total_episodes = v;
         }
+        // Source 2: SQLite backfill (from detail page visits)
+        if ((s.total_episodes == null || s.total_episodes === 0) && totalEpBackfill) {
+          const v = totalEpBackfill.get(s.id);
+          if (v) s.total_episodes = v;
+        }
+        // Source 3: eps field from API (least reliable — may include SPs or differ from actual)
+        if ((s.total_episodes == null || s.total_episodes === 0) && s.eps > 0) {
+          s.total_episodes = s.eps;
         }
       }
 

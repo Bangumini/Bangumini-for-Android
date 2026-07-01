@@ -1,21 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
-
-function CopyText({ text, style, children }: { text: string; style?: object; children?: React.ReactNode }) {
-  return (
-    <Pressable
-      onLongPress={() => {
-        void Clipboard.setStringAsync(text).then(() => {
-          Alert.alert("已复制", text);
-        });
-      }}
-      delayLongPress={400}
-    >
-      {children ?? <Text style={style}>{text}</Text>}
-    </Pressable>
-  );
-}
 import { router, useLocalSearchParams } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -40,16 +25,32 @@ import {
   readCachedPersonsWithin,
   readCachedSubject,
   readCachedSubjectDeepWithin,
+  readCachedValue,
   writeCachedCharacters,
   writeCachedCollection,
   writeCachedEpisodes,
   writeCachedPersons,
   writeCachedSubject,
+  writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
 import CachedImage from "../../src/components/CachedImage";
 import { EmptyState, LoadingState } from "../../src/components/ScreenState";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
+import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
+
+function CopyText({ text, copyText, style, children }: { text: string; copyText?: () => Promise<string>; style?: object; children?: React.ReactNode }) {
+  const handleLongPress = async () => {
+    const value = copyText ? await copyText() : text;
+    await Clipboard.setStringAsync(value);
+    Alert.alert("已复制", value);
+  };
+  return (
+    <Pressable onLongPress={handleLongPress} delayLongPress={400}>
+      {children ?? <Text style={style}>{text}</Text>}
+    </Pressable>
+  );
+}
 
 const DETAIL_CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const EPISODE_CACHE_MAX_AGE = 1000 * 60 * 30;
@@ -176,6 +177,25 @@ function getSummaryBlocks(summary: string): SummaryBlock[] {
   return blocks;
 }
 
+function upsertCollection(list: PagedResponse<UserCollection>, collection: UserCollection): PagedResponse<UserCollection> {
+  const data = [...list.data];
+  const idx = data.findIndex((c) => c.subject_id === collection.subject_id);
+  if (idx >= 0) {
+    data[idx] = collection;
+  } else {
+    data.unshift(collection);
+  }
+  return { ...list, data, total: list.total + (idx >= 0 ? 0 : 1) };
+}
+
+function removeCollection(list: PagedResponse<UserCollection>, subjectId: number): PagedResponse<UserCollection> {
+  const idx = list.data.findIndex((c) => c.subject_id === subjectId);
+  if (idx < 0) return list;
+  const data = [...list.data];
+  data.splice(idx, 1);
+  return { ...list, data, total: list.total - 1 };
+}
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <View style={styles.section}>
@@ -259,8 +279,42 @@ export default function SubjectDetailPage() {
     if (!username) return null;
     const next = await loadCollection(username, subjectId, true);
     queryClient.setQueryData(["collection", username, subjectId], next);
-    await queryClient.invalidateQueries({ queryKey: ["collections"] });
     return next;
+  }
+
+  async function syncCollectionsCache(previousType?: CollectionType) {
+    if (!username) return;
+    const next = queryClient.getQueryData<UserCollection>(["collection", username, subjectId]);
+    if (!next) return;
+
+    const newKey: [string, number, string] = ["collections", next.type, username];
+    queryClient.setQueryData<PagedResponse<UserCollection>>(
+      newKey,
+      (old) => old ? upsertCollection(old, next) : old,
+    );
+
+    if (previousType !== undefined && previousType !== next.type) {
+      queryClient.setQueryData<PagedResponse<UserCollection>>(
+        ["collections", previousType, username],
+        (old) => old ? removeCollection(old, next.subject_id) : old,
+      );
+    }
+
+    const cacheKey = `collections-${next.type}-${username}`;
+    const cached = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
+    if (cached?.data) {
+      await writeCachedValue(cacheKey, upsertCollection(cached, next));
+    }
+
+    if (previousType !== undefined && previousType !== next.type) {
+      const oldCacheKey = `collections-${previousType}-${username}`;
+      const oldCached = await readCachedValue<PagedResponse<UserCollection>>(oldCacheKey);
+      if (oldCached?.data) {
+        await writeCachedValue(oldCacheKey, removeCollection(oldCached, next.subject_id));
+      }
+    }
+
+    await queryClient.invalidateQueries({ queryKey: ["collections"] });
   }
 
   async function changeCollectionType(type: CollectionType) {
@@ -269,11 +323,13 @@ export default function SubjectDetailPage() {
       return;
     }
 
+    const prevType = collection?.type;
     setSaving(true);
     try {
       await postUserCollection(subjectId, { type });
       const next = await refreshCollection();
       if (next) await writeCachedCollection(username, next);
+      await syncCollectionsCache(prevType);
     } catch (error) {
       Alert.alert("保存失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
@@ -288,6 +344,7 @@ export default function SubjectDetailPage() {
     }
     if (!isDirty || targetEp === null) return;
 
+    const prevType = collection?.type;
     setSaving(true);
     try {
       if (!collection || collection.type !== 3) {
@@ -318,6 +375,10 @@ export default function SubjectDetailPage() {
       const next = await refreshCollection();
       if (next) await writeCachedCollection(username, next);
       setTargetEp(null);
+
+      if (prevType !== undefined && prevType !== 3) {
+        await syncCollectionsCache(prevType);
+      }
 
       if (targetEp >= totalEp && totalEp > 0) {
         Alert.alert("标记为看过？", `进度已达 ${totalEp} 集，是否把收藏状态改为「看过」？`, [
@@ -353,7 +414,8 @@ export default function SubjectDetailPage() {
       <View style={styles.hero}>
         <CachedImage uri={getPreferredSubjectCoverUrl(subject)} style={styles.cover} contentFit="cover" />
         <View style={styles.heroInfo}>
-          <CopyText text={subject.name_cn || subject.name}>
+          <CopyText text={subject.name_cn || subject.name}
+            copyText={async () => getSubjectTitleForCopy(subject.name_cn || subject.name)}>
             <Text style={styles.title}>{subject.name_cn || subject.name}</Text>
           </CopyText>
           {subject.name_cn ? (

@@ -70,16 +70,14 @@ async function loadCollections(type: CollectionType, username: string, force = f
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
     if (cached) {
-      // Merge fresher individual collection data from subject_collections
       await mergeSubjectCollections(cached, username);
+      cached.data = cached.data.filter((c) => c.type === type);
       return cached;
     }
-    // Cache miss or expired — try stale cache before hitting network
     const stale = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
     if (stale) {
-      // Merge fresher individual collection data from subject_collections
       await mergeSubjectCollections(stale, username);
-      // Return stale cache immediately, refresh in background
+      stale.data = stale.data.filter((c) => c.type === type);
       getAllUserCollections({ username, type }).then((data) => {
         writeCachedValue(cacheKey, data);
         writeCachedSubjectPreviews(data.data.map((c) => c.subject));
@@ -94,8 +92,6 @@ async function loadCollections(type: CollectionType, username: string, force = f
   const data = await getAllUserCollections({ username, type });
   await writeCachedValue(cacheKey, data);
   await writeCachedSubjectPreviews(data.data.map((collection) => collection.subject));
-  // Persist individual collections to subject_collections so detail page
-  // can read ep_status offline even for entries never opened in detail
   Promise.allSettled(
     data.data.map((c) => writeCachedCollection(username, c)),
   ).catch(() => {});
@@ -569,7 +565,7 @@ export default function CollectionsPage() {
               ListHeaderComponent={
                 <View style={styles.headerRow}>
                   <Text style={styles.count}>
-                    {CollectionTypeLabel[collectionType]} · {collections.length} / {collectionsQuery.data?.total ?? 0}
+                    {CollectionTypeLabel[collectionType]} · {collections.length}{collections.length !== (collectionsQuery.data?.total ?? 0) ? ` / ${collectionsQuery.data?.total ?? 0}` : ""}
                   </Text>
                   {collections.length > 0 && (
                     <Text style={styles.pageInfo}>

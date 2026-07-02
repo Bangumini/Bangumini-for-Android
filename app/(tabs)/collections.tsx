@@ -302,16 +302,42 @@ export default function CollectionsPage() {
     gcTime: CACHE_MAX_AGE * 2,
   });
 
+  // --- Phase 4: Bangumi episode counts for airing subjects (airedEpMap for sorting) ---
+  const airingIds = useMemo(
+    () => rawCollections.filter((item) => airingMap.has(item.subject_id)).map((item) => item.subject_id),
+    [rawCollections, airingMap],
+  );
+
+  const staleAiringIds = useMemo(
+    () => isWatching
+      ? rawCollections
+          .filter((item) => !airingMap.has(item.subject_id))
+          .filter((item) => {
+            const total = item.subject.eps || item.subject.total_episodes || 0;
+            return item.ep_status > 0 && (total === 0 || item.ep_status < total);
+          })
+          .map((item) => item.subject_id)
+      : [],
+    [rawCollections, airingMap, isWatching],
+  );
+
+  const allEpisodeIds = useMemo(
+    () => [...new Set([...airingIds, ...staleAiringIds])],
+    [airingIds, staleAiringIds],
+  );
+
   // --- Phase 3: AniList airing times (only for watching tab) ---
   const airingTimeTargets = useMemo(() => {
     if (!isWatching || airingMap.size === 0) return [];
+    if (airingIds.length === 0 && staleAiringIds.length === 0) return [];
+    const targetIds = new Set([...airingIds, ...staleAiringIds]);
     return rawCollections
-      .filter((item) => airingMap.has(item.subject_id))
+      .filter((item) => targetIds.has(item.subject_id) && item.subject.name)
       .map((item) => ({
         subjectId: item.subject_id,
         name: item.subject.name,
       }));
-  }, [rawCollections, airingMap, isWatching]);
+  }, [rawCollections, airingIds, staleAiringIds, airingMap, isWatching]);
 
   const airingTimeTargetKey = airingTimeTargets.map((t) => t.subjectId).join(",");
 
@@ -321,7 +347,6 @@ export default function CollectionsPage() {
       const map = new Map<number, AiringTime>();
       const cacheKeys = airingTimeTargets.map((t) => `${AIRING_CACHE_PREFIX}${t.subjectId}`);
 
-      // Read fresh and stale caches in parallel
       const [cachedByKey, staleByKey] = await Promise.all([
         readCachedValuesWithin<AiringTime>(cacheKeys, AIRING_TIME_CACHE_MAX_AGE),
         readCachedValues<AiringTime>(cacheKeys),
@@ -336,7 +361,6 @@ export default function CollectionsPage() {
       }
 
       const missing = airingTimeTargets.filter((t) => !map.has(t.subjectId));
-      // Batch-fetch with concurrency; abort when network is unavailable
       const AIRING_BATCH_SIZE = 3;
       for (let i = 0; i < missing.length; i += AIRING_BATCH_SIZE) {
         const batch = missing.slice(i, i + AIRING_BATCH_SIZE).filter((t) => t.name);
@@ -359,7 +383,6 @@ export default function CollectionsPage() {
           }
         }
 
-        // Entire batch returned no data — network likely unavailable, skip remaining
         if (allEmpty) break;
       }
       return map;
@@ -371,24 +394,18 @@ export default function CollectionsPage() {
 
   const airingTimeMap = airingTimeMapData ?? EMPTY_AIRING_TIME_MAP;
 
-  // --- Phase 4: Bangumi episode counts for airing subjects (airedEpMap for sorting) ---
-  const airingIds = useMemo(
-    () => rawCollections.filter((item) => airingMap.has(item.subject_id)).map((item) => item.subject_id),
-    [rawCollections, airingMap],
-  );
-
   const { data: airedEpMap } = useQuery({
-    queryKey: ["aired-episodes", todayDateKey, airingIds.join(",")],
+    queryKey: ["aired-episodes", todayDateKey, allEpisodeIds.join(",")],
     queryFn: async () => {
-      if (airingIds.length === 0) return EMPTY_EPISODE_MAP;
+      if (allEpisodeIds.length === 0) return EMPTY_EPISODE_MAP;
       const map = new Map<number, number>();
       const idsToFetch: number[] = [];
 
       // Batch-read all cached episode counts instead of sequential per-ID queries
-      const cacheKeys = airingIds.map((id) => `${EPISODES_CACHE_PREFIX}${id}`);
+      const cacheKeys = allEpisodeIds.map((id) => `${EPISODES_CACHE_PREFIX}${id}`);
       const cachedByKey = await readCachedValues<{ airedEp: number; checkedAt: number }>(cacheKeys);
 
-      for (const id of airingIds) {
+      for (const id of allEpisodeIds) {
         const cacheKey = `${EPISODES_CACHE_PREFIX}${id}`;
         const cached = cachedByKey.get(cacheKey);
         if (cached && Date.now() - cached.checkedAt <= CACHE_MAX_AGE) {
@@ -418,7 +435,7 @@ export default function CollectionsPage() {
       }
       return map;
     },
-    enabled: isWatching && airingIds.length > 0,
+    enabled: isWatching && allEpisodeIds.length > 0,
     staleTime: CACHE_MAX_AGE,
     gcTime: CACHE_MAX_AGE * 2,
   });

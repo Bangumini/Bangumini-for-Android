@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -121,12 +121,8 @@ async function loadNextSeason(force = false) {
   const key = cacheKey();
   if (!force) {
     const cached = await readCachedValueWithin<NextSeasonItem[]>(key, CACHE_MAX_AGE);
-    if (cached) return cached;
-    const stale = await readCachedValue<NextSeasonItem[]>(key);
-    if (stale) {
-      getNextSeason().then((data) => writeCachedValue(key, data)).catch(() => {});
-      return stale;
-    }
+    const cacheHit = cached ?? await readCachedValue<NextSeasonItem[]>(key);
+    if (cacheHit) return cacheHit;
   }
   const data = await getNextSeason();
   await writeCachedValue(key, data);
@@ -255,6 +251,36 @@ export default function NextSeasonPage() {
     staleTime: CACHE_MAX_AGE,
     gcTime: CACHE_MAX_AGE * 2,
   });
+
+  const bgRefreshedRef = useRef(false);
+
+  useEffect(() => {
+    if (!nextSeasonQuery.data || bgRefreshedRef.current) return;
+    bgRefreshedRef.current = true;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const key = cacheKey();
+        const baseItems = await getNextSeason();
+        if (cancelled) return;
+        await writeCachedValue(key, baseItems);
+
+        const { entries } = await resolveBangumiMatches(baseItems, true);
+        if (cancelled) return;
+
+        const current = queryClient.getQueryData<SeasonEntry[]>(["next-season", seasonInfo.seasonYear, seasonInfo.season]);
+        if (current && JSON.stringify(current) !== JSON.stringify(entries)) {
+          queryClient.setQueryData(["next-season", seasonInfo.seasonYear, seasonInfo.season], entries);
+        }
+      } catch {
+        // Ignore background refresh errors
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [nextSeasonQuery.data]);
 
   const allEntries = nextSeasonQuery.data ?? [];
   const searchQuery = search.trim().toLowerCase();

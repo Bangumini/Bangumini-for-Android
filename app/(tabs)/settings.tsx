@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 import { useQueryClient } from "@tanstack/react-query";
+import Constants from "expo-constants";
 
 import { cleanupExpiredCache } from "../../shared/storage/sqlite-cache";
 import {
   setCopySubjectTitleWithSeason,
   shouldCopySubjectTitleWithSeason,
 } from "../../src/api/subject-title-copy";
+import { checkForUpdate } from "../../src/api/update";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 
@@ -29,6 +31,13 @@ export default function SettingsPage() {
   const [token, setToken] = useState("");
   const [copyWithSeason, setCopyWithSeason] = useState(true);
   const [savingToken, setSavingToken] = useState(false);
+
+  const [updateStatus, setUpdateStatus] = useState<
+    "idle" | "checking" | "up-to-date" | "available" | "error"
+  >("idle");
+  const [latestVersion, setLatestVersion] = useState("");
+
+  const appVersion = Constants.expoConfig?.version ?? "0.1.0";
 
   useEffect(() => {
     void shouldCopySubjectTitleWithSeason().then(setCopyWithSeason);
@@ -66,6 +75,25 @@ export default function SettingsPage() {
     await logout();
     queryClient.clear();
     router.replace("/login");
+  }
+
+  async function handleCheckUpdate() {
+    setUpdateStatus("checking");
+    try {
+      const info = await checkForUpdate();
+      if (info.hasUpdate) {
+        setLatestVersion(info.latestVersion);
+        setUpdateStatus("available");
+      } else {
+        setUpdateStatus("up-to-date");
+      }
+    } catch {
+      setUpdateStatus("error");
+    }
+  }
+
+  function handleDownload() {
+    void Linking.openURL("https://github.com/Bangumini/Bangumini-for-Android/releases/latest");
   }
 
   return (
@@ -122,9 +150,48 @@ export default function SettingsPage() {
       </View>
 
       <View style={styles.section}>
+        <Text style={styles.sectionTitle}>版本更新</Text>
+        <SettingsRow
+          title={`当前版本 v${appVersion}`}
+          detail={updateStatus === "available" ? `新版本 v${latestVersion}` : undefined}
+        />
+        {updateStatus === "idle" && (
+          <Pressable style={styles.secondaryButton} onPress={() => void handleCheckUpdate()}>
+            <Text style={styles.secondaryText}>检查更新</Text>
+          </Pressable>
+        )}
+        {updateStatus === "checking" && (
+          <View style={styles.secondaryButton}>
+            <Text style={styles.secondaryText}>检查中...</Text>
+          </View>
+        )}
+        {updateStatus === "up-to-date" && (
+          <>
+            <Text style={styles.updateHint}>已是最新版本</Text>
+            <Pressable style={styles.secondaryButton} onPress={() => void handleCheckUpdate()}>
+              <Text style={styles.secondaryText}>重新检查</Text>
+            </Pressable>
+          </>
+        )}
+        {updateStatus === "available" && (
+          <Pressable style={styles.primaryButton} onPress={() => void handleDownload()}>
+            <Text style={styles.primaryText}>下载更新</Text>
+          </Pressable>
+        )}
+        {updateStatus === "error" && (
+          <>
+            <Text style={styles.updateError}>检查失败，请稍后重试</Text>
+            <Pressable style={styles.secondaryButton} onPress={() => void handleCheckUpdate()}>
+              <Text style={styles.secondaryText}>重试</Text>
+            </Pressable>
+          </>
+        )}
+      </View>
+
+      <View style={styles.section}>
         <Text style={styles.sectionTitle}>关于</Text>
-        <SettingsRow title="Bangumini Mobile" detail="Android 移植版 0.1.0" />
-        <Pressable style={styles.secondaryButton} onPress={() => void Linking.openURL("https://github.com/")}>
+        <SettingsRow title="Bangumini-for-Android" detail={`v${appVersion}`} />
+        <Pressable style={styles.secondaryButton} onPress={() => void Linking.openURL("https://github.com/Bangumini/Bangumini-for-Android")}>
           <Text style={styles.secondaryText}>打开项目主页</Text>
         </Pressable>
       </View>
@@ -238,5 +305,15 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  updateHint: {
+    color: colors.muted,
+    fontSize: 14,
+    textAlign: "center",
+  },
+  updateError: {
+    color: colors.danger,
+    fontSize: 14,
+    textAlign: "center",
   },
 });

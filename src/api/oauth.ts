@@ -74,7 +74,7 @@ export async function fetchAndCacheUsername(): Promise<string> {
     const res = await fetch("https://api.bgm.tv/v0/me", {
       headers: {
         Authorization: `Bearer ${token}`,
-        "User-Agent": "Bangumini-Mobile/1.0",
+        "User-Agent": "Bangumini-for-Android/1.0",
       },
     });
 

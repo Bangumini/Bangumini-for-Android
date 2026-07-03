@@ -21,7 +21,7 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
     token = "";
   }
   const headers: Record<string, string> = {
-    "User-Agent": "Bangumini-Mobile/1.0",
+    "User-Agent": "Bangumini-for-Android/1.0",
     Accept: "application/json",
   };
   if (token) {

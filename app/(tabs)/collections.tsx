@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, FlatList, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
@@ -69,23 +69,11 @@ async function loadCollections(type: CollectionType, username: string, force = f
   const cacheKey = `collections-${type}-${username}`;
   if (!force) {
     const cached = await readCachedValueWithin<PagedResponse<UserCollection>>(cacheKey, CACHE_MAX_AGE);
-    if (cached) {
-      await mergeSubjectCollections(cached, username);
-      cached.data = cached.data.filter((c) => c.type === type);
-      return cached;
-    }
-    const stale = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
-    if (stale) {
-      await mergeSubjectCollections(stale, username);
-      stale.data = stale.data.filter((c) => c.type === type);
-      getAllUserCollections({ username, type }).then((data) => {
-        writeCachedValue(cacheKey, data);
-        writeCachedSubjectPreviews(data.data.map((c) => c.subject));
-        Promise.allSettled(
-          data.data.map((c) => writeCachedCollection(username, c)),
-        ).catch(() => {});
-      }).catch(() => {});
-      return stale;
+    const cacheHit = cached ?? await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
+    if (cacheHit) {
+      await mergeSubjectCollections(cacheHit, username);
+      cacheHit.data = cacheHit.data.filter((c) => c.type === type);
+      return cacheHit;
     }
   }
 
@@ -117,16 +105,8 @@ async function mergeSubjectCollections(data: PagedResponse<UserCollection>, user
 async function loadCalendar(force = false) {
   if (!force) {
     const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE);
-    if (cached) return cached;
-    // Cache miss or expired — try stale cache before hitting network
-    const stale = await readCachedValue<CalendarItem[]>("calendar");
-    if (stale) {
-      getCalendar().then((data) => {
-        writeCachedValue("calendar", data);
-        writeCachedSubjectPreviews(data.flatMap((day) => day.items));
-      }).catch(() => {});
-      return stale;
-    }
+    const cacheHit = cached ?? await readCachedValue<CalendarItem[]>("calendar");
+    if (cacheHit) return cacheHit;
   }
   const data = await getCalendar();
   await writeCachedValue("calendar", data);
@@ -441,6 +421,59 @@ export default function CollectionsPage() {
   });
 
   const episodeMap = airedEpMap ?? EMPTY_EPISODE_MAP;
+
+  // --- Background refresh: always fetch network data after showing cache ---
+  const lastRefreshedKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const refreshKey = `collections-${collectionType}-${username}`;
+    if (!username || !collectionsQuery.data) return;
+    if (lastRefreshedKeyRef.current === refreshKey) return;
+    lastRefreshedKeyRef.current = refreshKey;
+
+    let cancelled = false;
+
+    const doRefresh = async () => {
+      try {
+        const [networkCollections, networkCalendar] = await Promise.all([
+          getAllUserCollections({ username: username!, type: collectionType }),
+          getCalendar(),
+        ]);
+        if (cancelled) return;
+
+        const cacheKey = `collections-${collectionType}-${username}`;
+        await writeCachedValue(cacheKey, networkCollections);
+        await writeCachedSubjectPreviews(networkCollections.data.map((c) => c.subject));
+        Promise.allSettled(networkCollections.data.map((c) => writeCachedCollection(username!, c))).catch(() => {});
+
+        await writeCachedValue("calendar", networkCalendar);
+        await writeCachedSubjectPreviews(networkCalendar.flatMap((day) => day.items));
+
+        const currentCollections = queryClient.getQueryData<PagedResponse<UserCollection>>(["collections", collectionType, username]);
+        const currentCalendar = queryClient.getQueryData<CalendarItem[]>(["calendar"]);
+
+        const filtered = { ...networkCollections, data: networkCollections.data.filter((c) => c.type === collectionType) };
+
+        if (currentCollections && JSON.stringify(currentCollections.data) !== JSON.stringify(filtered.data)) {
+          queryClient.setQueryData(["collections", collectionType, username], filtered);
+          queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] });
+          queryClient.invalidateQueries({ queryKey: ["episode-totals"] });
+          queryClient.invalidateQueries({ queryKey: ["anilist-airing-times"] });
+          queryClient.invalidateQueries({ queryKey: ["aired-episodes"] });
+        }
+
+        if (currentCalendar && JSON.stringify(currentCalendar) !== JSON.stringify(networkCalendar)) {
+          queryClient.setQueryData(["calendar"], networkCalendar);
+        }
+      } catch {
+        // Ignore background refresh errors — user still sees cached data
+      }
+    };
+
+    doRefresh();
+
+    return () => { cancelled = true; };
+  }, [collectionType, username, collectionsQuery.data]);
 
   // --- Merge all data sources ---
   const enrichedCollections = useMemo(() => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, FlatList, RefreshControl, SectionList, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -42,15 +42,8 @@ type EnrichedItem = SubjectSmall & { weekday: number };
 async function loadCalendar(force = false) {
   if (!force) {
     const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE);
-    if (cached) return cached;
-    const stale = await readCachedValue<CalendarItem[]>("calendar");
-    if (stale) {
-      getCalendar().then((data) => {
-        writeCachedValue("calendar", data);
-        writeCachedSubjectPreviews(data.flatMap((day) => day.items));
-      }).catch(() => {});
-      return stale;
-    }
+    const cacheHit = cached ?? await readCachedValue<CalendarItem[]>("calendar");
+    if (cacheHit) return cacheHit;
   }
   const data = await getCalendar();
   await writeCachedValue("calendar", data);
@@ -124,6 +117,30 @@ export default function CalendarPage() {
     queryKey: ["calendar"],
     queryFn: () => loadCalendar(),
   });
+
+  const bgRefreshedRef = useRef(false);
+
+  useEffect(() => {
+    if (!calendarQuery.data || bgRefreshedRef.current) return;
+    bgRefreshedRef.current = true;
+
+    let cancelled = false;
+
+    getCalendar()
+      .then(async (data) => {
+        if (cancelled) return;
+        await writeCachedValue("calendar", data);
+        await writeCachedSubjectPreviews(data.flatMap((day) => day.items));
+
+        const current = queryClient.getQueryData<CalendarItem[]>(["calendar"]);
+        if (current && JSON.stringify(current) !== JSON.stringify(data)) {
+          queryClient.setQueryData(["calendar"], data);
+        }
+      })
+      .catch(() => {});
+
+    return () => { cancelled = true; };
+  }, [calendarQuery.data]);
 
   const searchQuery = search.trim().toLowerCase();
   const isSearching = !!searchQuery;

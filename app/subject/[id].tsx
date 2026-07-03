@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { router, useLocalSearchParams } from "expo-router";
@@ -256,6 +256,69 @@ export default function SubjectDetailPage() {
     enabled: Number.isFinite(subjectId),
     queryFn: () => loadCharacters(subjectId),
   });
+
+  // --- Background refresh: fetch network data after showing cache ---
+  const lastRefreshedKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const refreshKey = `subject-${subjectId}`;
+    if (!Number.isFinite(subjectId)) return;
+    if (lastRefreshedKeyRef.current === refreshKey) return;
+    lastRefreshedKeyRef.current = refreshKey;
+
+    let cancelled = false;
+
+    const doRefresh = async () => {
+      try {
+        const results = await Promise.allSettled([
+          getSubject(subjectId).then((s) => finalizeSubjectWrite(subjectId, s)),
+          getEpisodes(subjectId),
+          username
+            ? getUserCollection(username, subjectId).catch((e) => {
+                if (isNotFoundError(e)) {
+                  deleteCachedCollection(username, subjectId);
+                  return null;
+                }
+                throw e;
+              })
+            : Promise.resolve(null),
+        ]);
+        if (cancelled) return;
+
+        const [subjectResult, episodesResult, collectionResult] = results;
+
+        if (subjectResult.status === "fulfilled") {
+          const currentSubject = queryClient.getQueryData<Subject>(["subject", subjectId]);
+          if (currentSubject && JSON.stringify(currentSubject) !== JSON.stringify(subjectResult.value)) {
+            queryClient.setQueryData(["subject", subjectId], subjectResult.value);
+          }
+        }
+
+        if (episodesResult.status === "fulfilled") {
+          const currentEpisodes = queryClient.getQueryData<PagedResponse<Episode>>(["episodes", subjectId]);
+          if (currentEpisodes && JSON.stringify(currentEpisodes) !== JSON.stringify(episodesResult.value)) {
+            queryClient.setQueryData(["episodes", subjectId], episodesResult.value);
+          }
+        }
+
+        if (collectionResult.status === "fulfilled" && username) {
+          const currentCollection = queryClient.getQueryData<UserCollection>(["collection", username, subjectId]);
+          if (
+            currentCollection
+            && JSON.stringify(currentCollection) !== JSON.stringify(collectionResult.value)
+          ) {
+            queryClient.setQueryData(["collection", username, subjectId], collectionResult.value);
+          }
+        }
+      } catch {
+        // Ignore background refresh errors
+      }
+    };
+
+    doRefresh();
+
+    return () => { cancelled = true; };
+  }, [subjectId, username, subjectQuery.data, collectionQuery.data]);
 
   const subject = subjectQuery.data;
   const episodes = episodesQuery.data;

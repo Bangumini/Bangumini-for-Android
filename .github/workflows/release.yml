@@ -27,9 +27,15 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-35 build-tools;35.0.0'
+          packages: >-
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;26.1.10909125
 
       - run: npm ci
+
+      - name: Expo prebuild (generate native project)
+        run: npx expo prebuild --platform android --no-install
 
       - name: Build APK
         run: cd android && ./gradlew assembleRelease

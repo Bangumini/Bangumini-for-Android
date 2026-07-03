@@ -10,6 +10,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { getAccessToken } from "../src/api/oauth";
+import { DialogProvider } from "../src/components/Dialog";
 import { colors } from "../src/theme/colors";
 import { setTokenProvider } from "../shared/api/client";
 
@@ -86,8 +87,9 @@ export default function RootLayout() {
       <GestureHandlerRootView style={{ flex: 1, backgroundColor: colors.background }}>
         <SafeAreaProvider>
           <QueryClientProvider client={queryClient}>
-            <StatusBar style="light" />
-            <Stack
+            <DialogProvider>
+              <StatusBar style="light" />
+              <Stack
               screenOptions={{
                 headerStyle: { backgroundColor: colors.background },
                 headerTintColor: colors.text,
@@ -100,6 +102,7 @@ export default function RootLayout() {
               <Stack.Screen name="subject/[id]" options={{ title: "条目详情" }} />
               <Stack.Screen name="oauth/callback" options={{ headerShown: false, presentation: "modal" }} />
             </Stack>
+            </DialogProvider>
           </QueryClientProvider>
         </SafeAreaProvider>
       </GestureHandlerRootView>

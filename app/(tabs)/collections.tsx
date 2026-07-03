@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, FlatList, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   runOnJS,
@@ -39,6 +39,7 @@ import { EmptyState, ErrorState, LoadingState } from "../../src/components/Scree
 import { SubjectCard } from "../../src/components/SubjectCard";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
+import { useAlert } from "../../src/components/Dialog";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const AIRING_CACHE_PREFIX = "anilist-airing-";
@@ -137,6 +138,7 @@ function matchesSearch(collection: UserCollection, query: string) {
 }
 
 export default function CollectionsPage() {
+  const alert = useAlert();
   const queryClient = useQueryClient();
   const { checking, loggedIn, username } = useAuth();
   const [collectionType, setCollectionType] = useState<CollectionType>(3);
@@ -565,7 +567,7 @@ export default function CollectionsPage() {
       queryClient.invalidateQueries({ queryKey: ["anilist-airing-times"] });
       queryClient.invalidateQueries({ queryKey: ["aired-episodes"] });
     } catch (error) {
-      Alert.alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setRefreshing(false);
     }
@@ -574,7 +576,7 @@ export default function CollectionsPage() {
   async function copyTitle(collection: UserCollection) {
     const title = collection.subject.name_cn || collection.subject.name;
     await Clipboard.setStringAsync(await getSubjectTitleForCopy(title));
-    Alert.alert("已复制", title);
+    alert("已复制", title);
   }
 
   if (checking) return <LoadingState label="检查登录状态" />;

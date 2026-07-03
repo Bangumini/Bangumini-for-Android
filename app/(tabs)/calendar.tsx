@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, FlatList, RefreshControl, SectionList, StyleSheet, Text, View } from "react-native";
+import { FlatList, RefreshControl, SectionList, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
@@ -27,6 +27,7 @@ import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
+import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
@@ -64,6 +65,7 @@ function matchesSearch(item: EnrichedItem, query: string) {
 type CalendarSection = { title: string; weekday: number; data: SubjectSmall[] };
 
 export default function CalendarPage() {
+  const alert = useAlert();
   const queryClient = useQueryClient();
   const [weekday, setWeekday] = useState(getTodayBangumiWeekday());
   const [search, setSearch] = useState("");
@@ -210,7 +212,7 @@ export default function CalendarPage() {
       const next = await loadCalendar(true);
       queryClient.setQueryData(["calendar"], next);
     } catch (error) {
-      Alert.alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setRefreshing(false);
     }

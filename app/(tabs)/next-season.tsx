@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
@@ -26,6 +26,7 @@ import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
+import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
@@ -178,6 +179,7 @@ async function resolveBangumiMatches(
 }
 
 export default function NextSeasonPage() {
+  const alert = useAlert();
   const queryClient = useQueryClient();
   const [segment, setSegment] = useState("all");
   const [search, setSearch] = useState("");
@@ -323,7 +325,7 @@ export default function NextSeasonPage() {
       const { entries } = await resolveBangumiMatches(baseItems, true);
       queryClient.setQueryData(["next-season", seasonInfo.seasonYear, seasonInfo.season], entries);
     } catch (error) {
-      Alert.alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setRefreshing(false);
     }

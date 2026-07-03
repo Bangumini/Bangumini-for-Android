@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 import { useQueryClient } from "@tanstack/react-query";
 import Constants from "expo-constants";
@@ -11,6 +11,7 @@ import {
 } from "../../src/api/subject-title-copy";
 import { checkForUpdate } from "../../src/api/update";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
 function SettingsRow({ title, detail, children }: { title: string; detail?: string; children?: React.ReactNode }) {
@@ -26,6 +27,7 @@ function SettingsRow({ title, detail, children }: { title: string; detail?: stri
 }
 
 export default function SettingsPage() {
+  const alert = useAlert();
   const queryClient = useQueryClient();
   const { checking, loggedIn, username, loginWithToken, logout, refresh } = useAuth();
   const [token, setToken] = useState("");
@@ -49,9 +51,9 @@ export default function SettingsPage() {
     try {
       await loginWithToken(token.trim());
       setToken("");
-      Alert.alert("已更新", "Access Token 已保存");
+      alert("已更新", "Access Token 已保存");
     } catch (error) {
-      Alert.alert("更新失败", error instanceof Error ? error.message : "请检查 token");
+      alert("更新失败", error instanceof Error ? error.message : "请检查 token");
     } finally {
       setSavingToken(false);
     }
@@ -65,9 +67,9 @@ export default function SettingsPage() {
   async function clearExpiredCache() {
     try {
       const expiredImages = await cleanupExpiredCache();
-      Alert.alert("清理完成", `已清理过期缓存${expiredImages.length ? `，图片记录 ${expiredImages.length} 条` : ""}`);
+      alert("清理完成", `已清理过期缓存${expiredImages.length ? `，图片记录 ${expiredImages.length} 条` : ""}`);
     } catch (error) {
-      Alert.alert("清理失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("清理失败", error instanceof Error ? error.message : "请稍后重试");
     }
   }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { router, useLocalSearchParams } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -37,13 +37,15 @@ import CachedImage from "../../src/components/CachedImage";
 import { EmptyState, LoadingState } from "../../src/components/ScreenState";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
+import { useAlert } from "../../src/components/Dialog";
 import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
 
 function CopyText({ text, copyText, style, children }: { text: string; copyText?: () => Promise<string>; style?: object; children?: React.ReactNode }) {
+  const alert = useAlert();
   const handleLongPress = async () => {
     const value = copyText ? await copyText() : text;
     await Clipboard.setStringAsync(value);
-    Alert.alert("已复制", value);
+    alert("已复制", value);
   };
   return (
     <Pressable onLongPress={handleLongPress} delayLongPress={400}>
@@ -206,6 +208,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 export default function SubjectDetailPage() {
+  const alert = useAlert();
   const params = useLocalSearchParams<{ id: string }>();
   const subjectId = Number(params.id);
   const queryClient = useQueryClient();
@@ -394,7 +397,7 @@ export default function SubjectDetailPage() {
       if (next) await writeCachedCollection(username, next);
       await syncCollectionsCache(prevType);
     } catch (error) {
-      Alert.alert("保存失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("保存失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setSaving(false);
     }
@@ -444,13 +447,13 @@ export default function SubjectDetailPage() {
       }
 
       if (targetEp >= totalEp && totalEp > 0) {
-        Alert.alert("标记为看过？", `进度已达 ${totalEp} 集，是否把收藏状态改为「看过」？`, [
+        alert("标记为看过？", `进度已达 ${totalEp} 集，是否把收藏状态改为「看过」？`, [
           { text: "暂不", style: "cancel" },
           { text: "标记", onPress: () => void changeCollectionType(2) },
         ]);
       }
     } catch (error) {
-      Alert.alert("进度保存失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("进度保存失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setSaving(false);
     }

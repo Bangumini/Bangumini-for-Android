@@ -1,12 +1,14 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 
 import { loginWithBrowser } from "../src/api/oauth";
+import { useAlert } from "../src/components/Dialog";
 import { useAuth } from "../src/hooks/useAuth";
 import { colors } from "../src/theme/colors";
 
 export default function LoginPage() {
+  const alert = useAlert();
   const { loginWithToken } = useAuth();
   const [token, setTokenValue] = useState("");
   const [loading, setLoading] = useState(false);
@@ -17,7 +19,7 @@ export default function LoginPage() {
       await action();
       router.replace("/collections");
     } catch (error) {
-      Alert.alert("登录失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("登录失败", error instanceof Error ? error.message : "请稍后重试");
       router.back();
     } finally {
       setLoading(false);

@@ -132,11 +132,63 @@ function withProGuardRules(config) {
 function withNdkAbiFilter(config) {
   return withAppBuildGradle(config, (config) => {
     const content = config.modResults.contents;
-    // Insert ndk { abiFilters 'arm64-v8a' } after versionName in defaultConfig
-    config.modResults.contents = content.replace(
-      /(versionName\s+"[^"]*")/,
-      "$1\n        ndk {\n            abiFilters 'arm64-v8a'\n        }"
+    if (!content.includes("abiFilters 'arm64-v8a'")) {
+      config.modResults.contents = content.replace(
+        /(versionName\s+"[^"]*")/,
+        "$1\n        ndk {\n            abiFilters 'arm64-v8a'\n        }"
+      );
+    }
+    return config;
+  });
+}
+
+function withReleaseSigningConfig(config) {
+  return withAppBuildGradle(config, (config) => {
+    const debugSigningConfig = `    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }`;
+
+    const releaseSigningConfig = `    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+        release {
+            def releaseStoreFile = System.getenv("ANDROID_RELEASE_STORE_FILE")
+            def releaseStorePassword = System.getenv("ANDROID_RELEASE_STORE_PASSWORD")
+            def releaseKeyAlias = System.getenv("ANDROID_RELEASE_KEY_ALIAS")
+            def releaseKeyPassword = System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+            if (releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }`;
+
+    let content = config.modResults.contents;
+
+    if (!content.includes("ANDROID_RELEASE_STORE_FILE")) {
+      if (!content.includes(debugSigningConfig)) {
+        throw new Error("Unable to find the Android debug signing config block.");
+      }
+      content = content.replace(debugSigningConfig, releaseSigningConfig);
+    }
+
+    content = content.replace(
+      "            signingConfig signingConfigs.debug\n            shrinkResources",
+      '            signingConfig System.getenv("ANDROID_RELEASE_STORE_FILE") ? signingConfigs.release : signingConfigs.debug\n            shrinkResources'
     );
+
+    config.modResults.contents = content;
     return config;
   });
 }
@@ -158,6 +210,7 @@ module.exports = function withBanguminiConfig(config) {
   config = withSecureStoreBackupRules(config);
   config = withProGuardRules(config);
   config = withNdkAbiFilter(config);
+  config = withReleaseSigningConfig(config);
   config = withOptimizedBuild(config);
   return config;
 };

@@ -5,6 +5,7 @@ android/app/build/
 android/build/
 android/keystore.properties
 android/app/*.keystore
+*.keystore
 dist/
 build/
 coverage/

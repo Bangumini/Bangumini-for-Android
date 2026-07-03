@@ -1,5 +1,16 @@
 const { version } = require("./package.json");
 
+function getAndroidVersionCode(versionName) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(versionName);
+
+  if (!match) {
+    throw new Error(`Invalid package version for Android versionCode: ${versionName}`);
+  }
+
+  const [, major, minor, patch] = match.map(Number);
+  return major * 10000 + minor * 100 + patch;
+}
+
 module.exports = {
   expo: {
     name: "Bangumini",
@@ -37,6 +48,7 @@ module.exports = {
     ],
     android: {
       package: "dev.raycast.bangumini",
+      versionCode: getAndroidVersionCode(version),
       adaptiveIcon: {
         backgroundColor: "#101216",
         foregroundImage: "./assets/adaptive-icon.png",

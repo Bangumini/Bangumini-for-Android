@@ -91,8 +91,8 @@ android {
         applicationId 'dev.raycast.bangumini'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 10001
+        versionName "1.0.1"
         ndk {
             abiFilters 'arm64-v8a'
         }
@@ -104,15 +104,25 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            def releaseStoreFile = System.getenv("ANDROID_RELEASE_STORE_FILE")
+            def releaseStorePassword = System.getenv("ANDROID_RELEASE_STORE_PASSWORD")
+            def releaseKeyAlias = System.getenv("ANDROID_RELEASE_KEY_ALIAS")
+            def releaseKeyPassword = System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+            if (releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig System.getenv("ANDROID_RELEASE_STORE_FILE") ? signingConfigs.release : signingConfigs.debug
             shrinkResources (findProperty('android.enableShrinkResourcesInReleaseBuilds')?.toBoolean() ?: false)
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"

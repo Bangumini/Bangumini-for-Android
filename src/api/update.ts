@@ -21,37 +21,33 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+const LATEST_JSON_URL =
+  "https://github.com/Bangumini/Bangumini-for-Android/releases/latest/download/latest.json";
+
+interface LatestJson {
+  version: string;
+  url: string;
+}
+
 export async function checkForUpdate(): Promise<UpdateInfo> {
   const currentVersion = Constants.expoConfig?.version ?? "0.0.0";
-  const repo = "Bangumini/Bangumini-for-Android";
 
-  const resp = await fetch(
-    `https://api.github.com/repos/${repo}/releases/latest`,
-    { headers: { Accept: "application/vnd.github+json" } },
-  );
+  const resp = await fetch(LATEST_JSON_URL);
 
   if (!resp.ok) {
-    throw new Error(`GitHub API error ${resp.status}`);
+    throw new Error(`HTTP ${resp.status}`);
   }
 
-  const release: {
-    tag_name: string;
-    html_url: string;
-    assets: Array<{ name: string; browser_download_url: string }>;
-  } = await resp.json();
+  const data: LatestJson = await resp.json();
 
-  const latestVersion = release.tag_name.replace(/^v/, "");
+  const latestVersion = data.version;
   const hasUpdate = compareVersions(latestVersion, currentVersion) > 0;
-
-  const apkAsset = release.assets?.find(
-    (a) => a.name?.endsWith(".apk") && !a.name?.includes("debug"),
-  );
 
   return {
     hasUpdate,
     currentVersion,
     latestVersion,
-    downloadUrl: apkAsset?.browser_download_url,
-    releaseUrl: release.html_url,
+    downloadUrl: data.url,
+    releaseUrl: "https://github.com/Bangumini/Bangumini-for-Android/releases/latest",
   };
 }

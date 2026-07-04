@@ -1,4 +1,7 @@
+import { Platform } from "react-native";
 import Constants from "expo-constants";
+import * as FileSystem from "expo-file-system";
+import * as IntentLauncher from "expo-intent-launcher";
 
 export interface UpdateInfo {
   hasUpdate: boolean;
@@ -6,6 +9,11 @@ export interface UpdateInfo {
   latestVersion: string;
   downloadUrl?: string;
   releaseUrl: string;
+}
+
+export interface DownloadProgress {
+  totalBytesWritten: number;
+  totalBytesExpectedToWrite: number;
 }
 
 export function compareVersions(a: string, b: string): number {
@@ -50,4 +58,50 @@ export async function checkForUpdate(): Promise<UpdateInfo> {
     downloadUrl: data.url,
     releaseUrl: "https://github.com/Bangumini/Bangumini-for-Android/releases/latest",
   };
+}
+
+export async function downloadApk(
+  url: string,
+  onProgress?: (progress: DownloadProgress) => void,
+): Promise<string> {
+  const fileUri = FileSystem.cacheDirectory + "update.apk";
+
+  const downloadResumable = FileSystem.createDownloadResumable(
+    url,
+    fileUri,
+    {},
+    onProgress,
+  );
+
+  const result = await downloadResumable.downloadAsync();
+  if (!result?.uri) {
+    throw new Error("Download failed");
+  }
+
+  return fileUri;
+}
+
+const FILE_PROVIDER_AUTHORITY = "dev.raycast.bangumini.fileprovider";
+
+export async function installApk(fileUri: string): Promise<void> {
+  if (Platform.OS !== "android") return;
+
+  const contentUri = fileUri.replace(
+    FileSystem.cacheDirectory!,
+    `content://${FILE_PROVIDER_AUTHORITY}/apk/`,
+  );
+
+  await IntentLauncher.startActivityAsync("android.intent.action.VIEW", {
+    data: contentUri,
+    type: "application/vnd.android.package-archive",
+    flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
+  });
+}
+
+export async function openInstallPermissionSettings(): Promise<void> {
+  if (Platform.OS !== "android") return;
+
+  await IntentLauncher.startActivityAsync("android.settings.MANAGE_UNKNOWN_APP_SOURCES", {
+    data: "package:dev.raycast.bangumini",
+  });
 }

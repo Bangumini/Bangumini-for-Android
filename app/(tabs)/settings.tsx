@@ -9,7 +9,8 @@ import {
   setCopySubjectTitleWithSeason,
   shouldCopySubjectTitleWithSeason,
 } from "../../src/api/subject-title-copy";
-import { checkForUpdate } from "../../src/api/update";
+import { checkForUpdate, downloadApk, installApk, openInstallPermissionSettings } from "../../src/api/update";
+import type { DownloadProgress } from "../../src/api/update";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
@@ -35,9 +36,10 @@ export default function SettingsPage() {
   const [savingToken, setSavingToken] = useState(false);
 
   const [updateStatus, setUpdateStatus] = useState<
-    "idle" | "checking" | "up-to-date" | "available" | "error"
+    "idle" | "checking" | "up-to-date" | "available" | "downloading" | "installing" | "error"
   >("idle");
   const [latestVersion, setLatestVersion] = useState("");
+  const [downloadProgress, setDownloadProgress] = useState(0);
 
   const appVersion = Constants.expoConfig?.version ?? "0.1.0";
 
@@ -94,8 +96,41 @@ export default function SettingsPage() {
     }
   }
 
-  function handleDownload() {
-    void Linking.openURL("https://github.com/Bangumini/Bangumini-for-Android/releases/latest");
+  async function handleDownload() {
+    const info = await checkForUpdate();
+    if (!info.hasUpdate || !info.downloadUrl) return;
+
+    setUpdateStatus("downloading");
+    setDownloadProgress(0);
+
+    try {
+      const fileUri = await downloadApk(info.downloadUrl, (progress: DownloadProgress) => {
+        const pct = progress.totalBytesExpectedToWrite > 0
+          ? progress.totalBytesWritten / progress.totalBytesExpectedToWrite
+          : 0;
+        setDownloadProgress(Math.round(pct * 100));
+      });
+
+      alert(
+        "下载完成",
+        "需要开启「安装未知应用」权限才能安装更新",
+        [
+          { text: "去授权", onPress: () => void openInstallPermissionSettings() },
+          { text: "开始安装", onPress: () => void doInstall(fileUri) },
+        ],
+      );
+    } catch (error) {
+      setUpdateStatus("error");
+    }
+  }
+
+  async function doInstall(fileUri: string) {
+    setUpdateStatus("installing");
+    try {
+      await installApk(fileUri);
+    } catch {
+      setUpdateStatus("error");
+    }
   }
 
   return (
@@ -179,6 +214,17 @@ export default function SettingsPage() {
           <Pressable style={styles.primaryButton} onPress={() => void handleDownload()}>
             <Text style={styles.primaryText}>下载更新</Text>
           </Pressable>
+        )}
+        {updateStatus === "downloading" && (
+          <View>
+            <View style={styles.progressBar}>
+              <View style={[styles.progressFill, { width: `${downloadProgress}%` }]} />
+            </View>
+            <Text style={styles.updateHint}>下载中 {downloadProgress}%</Text>
+          </View>
+        )}
+        {updateStatus === "installing" && (
+          <Text style={styles.updateHint}>正在准备安装...</Text>
         )}
         {updateStatus === "error" && (
           <>
@@ -317,5 +363,16 @@ const styles = StyleSheet.create({
     color: colors.danger,
     fontSize: 14,
     textAlign: "center",
+  },
+  progressBar: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: colors.chip,
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: "100%",
+    backgroundColor: colors.primary,
+    borderRadius: 3,
   },
 });

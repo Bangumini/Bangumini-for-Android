@@ -1,4 +1,4 @@
-package dev.raycast.bangumini
+package com.bangumini.app
 
 import android.app.Application
 import android.content.res.Configuration

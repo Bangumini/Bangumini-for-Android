@@ -47,7 +47,7 @@ module.exports = {
       ],
     ],
     android: {
-      package: "dev.raycast.bangumini",
+      package: "com.bangumini.app",
       versionCode: getAndroidVersionCode(version),
       adaptiveIcon: {
         backgroundColor: "#101216",

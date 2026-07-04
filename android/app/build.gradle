@@ -86,9 +86,9 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace 'dev.raycast.bangumini'
+    namespace 'com.bangumini.app'
     defaultConfig {
-        applicationId 'dev.raycast.bangumini'
+        applicationId 'com.bangumini.app'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 10001

@@ -35,7 +35,7 @@
         <category android:name="android.intent.category.DEFAULT"/>
         <category android:name="android.intent.category.BROWSABLE"/>
         <data android:scheme="bangumini"/>
-        <data android:scheme="dev.raycast.bangumini"/>
+        <data android:scheme="com.bangumini.app"/>
       </intent-filter>
     </activity>
   </application>

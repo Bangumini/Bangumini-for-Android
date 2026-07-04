@@ -35,7 +35,7 @@
       ]
     ],
     "android": {
-      "package": "dev.raycast.bangumini",
+      "package": "com.bangumini.app",
       "adaptiveIcon": {
         "backgroundColor": "#101216",
         "foregroundImage": "./assets/adaptive-icon.png"

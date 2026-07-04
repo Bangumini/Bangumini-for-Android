@@ -81,7 +81,7 @@ export async function downloadApk(
   return fileUri;
 }
 
-const FILE_PROVIDER_AUTHORITY = "dev.raycast.bangumini.fileprovider";
+const FILE_PROVIDER_AUTHORITY = "com.bangumini.app.fileprovider";
 
 export async function installApk(fileUri: string): Promise<void> {
   if (Platform.OS !== "android") return;
@@ -102,6 +102,6 @@ export async function openInstallPermissionSettings(): Promise<void> {
   if (Platform.OS !== "android") return;
 
   await IntentLauncher.startActivityAsync("android.settings.MANAGE_UNKNOWN_APP_SOURCES", {
-    data: "package:dev.raycast.bangumini",
+    data: "package:com.bangumini.app",
   });
 }

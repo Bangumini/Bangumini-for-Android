@@ -1,4 +1,4 @@
-const { withDangerousMod, withGradleProperties, withAppBuildGradle } = require("@expo/config-plugins");
+const { withDangerousMod, withGradleProperties, withAppBuildGradle, withMainApplication } = require("@expo/config-plugins");
 const fs = require("fs");
 const path = require("path");
 
@@ -206,11 +206,50 @@ function withOptimizedBuild(config) {
   });
 }
 
+function withBanguminiMediaModule(config) {
+  config = withDangerousMod(config, [
+    "android",
+    (config) => {
+      const platformRoot = config.modRequest.platformProjectRoot;
+      const pkgDir = path.join(platformRoot, "app", "src", "main", "java", "com", "bangumini", "app");
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.copyFileSync(
+        path.join(__dirname, "BanguminiMediaModule.kt"),
+        path.join(pkgDir, "BanguminiMediaModule.kt")
+      );
+      fs.copyFileSync(
+        path.join(__dirname, "BanguminiMediaPackage.kt"),
+        path.join(pkgDir, "BanguminiMediaPackage.kt")
+      );
+      return config;
+    },
+  ]);
+
+  config = withMainApplication(config, (config) => {
+    const content = config.modResults.contents;
+    if (!content.includes("BanguminiMediaPackage")) {
+      config.modResults.contents = content
+        .replace(
+          /^(import expo\.modules\.ApplicationLifecycleDispatcher.*)$/m,
+          "$1\n\nimport com.bangumini.app.BanguminiMediaPackage"
+        )
+        .replace(
+          /(val packages = PackageList\(this\)\.packages)/,
+          "$1\n            packages.add(BanguminiMediaPackage())"
+        );
+    }
+    return config;
+  });
+
+  return config;
+}
+
 module.exports = function withBanguminiConfig(config) {
   config = withSecureStoreBackupRules(config);
   config = withProGuardRules(config);
   config = withNdkAbiFilter(config);
   config = withReleaseSigningConfig(config);
   config = withOptimizedBuild(config);
+  config = withBanguminiMediaModule(config);
   return config;
 };

@@ -34,10 +34,13 @@ import {
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
 import CachedImage from "../../src/components/CachedImage";
+import ImageViewer from "../../src/components/ImageViewer";
 import { EmptyState, LoadingState } from "../../src/components/ScreenState";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 import { useAlert } from "../../src/components/Dialog";
+import { saveImageToGallery } from "../../src/utils/saveImage";
+import { showToast } from "../../src/utils/toast";
 import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
 
 function CopyText({ text, copyText, style, children }: { text: string; copyText?: () => Promise<string>; style?: object; children?: React.ReactNode }) {
@@ -216,6 +219,7 @@ export default function SubjectDetailPage() {
   const [targetEp, setTargetEp] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [viewerVisible, setViewerVisible] = useState(false);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -472,13 +476,37 @@ export default function SubjectDetailPage() {
   }
 
   return (
+    <>
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}
       refreshControl={
         <RefreshControl refreshing={refreshing} onRefresh={handleRefresh}
           tintColor={colors.primary} colors={[colors.primary]} />
       }>
       <View style={styles.hero}>
-        <CachedImage uri={getPreferredSubjectCoverUrl(subject)} style={styles.cover} contentFit="cover" />
+        <Pressable
+          onPress={() => setViewerVisible(true)}
+          onLongPress={() => {
+            const url = getPreferredSubjectCoverUrl(subject);
+            if (!url) return;
+            alert("保存图片", "是否保存到相册？", [
+              { text: "取消", style: "cancel" },
+              {
+                text: "保存",
+                onPress: async () => {
+                  try {
+                    await saveImageToGallery(url);
+                    showToast("已保存到 Bangumini 相册");
+                  } catch (err: unknown) {
+                    const message = err instanceof Error ? err.message : "保存失败";
+                    showToast(message);
+                  }
+                },
+              },
+            ]);
+          }}
+        >
+          <CachedImage uri={getPreferredSubjectCoverUrl(subject)} style={styles.cover} contentFit="cover" />
+        </Pressable>
         <View style={styles.heroInfo}>
           <CopyText text={subject.name_cn || subject.name}
             copyText={async () => getSubjectTitleForCopy(subject.name_cn || subject.name)}>
@@ -603,6 +631,12 @@ export default function SubjectDetailPage() {
         <Text style={styles.linkText}>在浏览器中打开</Text>
       </Pressable>
     </ScrollView>
+    <ImageViewer
+      visible={viewerVisible}
+      uri={getPreferredSubjectCoverUrl(subject) ?? ""}
+      onClose={() => setViewerVisible(false)}
+    />
+    </>
   );
 }
 

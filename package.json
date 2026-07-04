@@ -6,6 +6,7 @@
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
+    "prebuild:android": "NODE_OPTIONS=\"--no-experimental-strip-types\" npx expo prebuild --platform android",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "ios": "expo run:ios"

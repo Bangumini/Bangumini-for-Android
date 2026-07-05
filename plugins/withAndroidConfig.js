@@ -1,4 +1,4 @@
-const { withDangerousMod, withGradleProperties, withAppBuildGradle, withMainApplication } = require("@expo/config-plugins");
+const { withDangerousMod, withGradleProperties, withAppBuildGradle, withMainApplication, withAndroidManifest } = require("@expo/config-plugins");
 const fs = require("fs");
 const path = require("path");
 
@@ -17,6 +17,12 @@ const DATA_EXTRACTION_RULES_XML = `<?xml version="1.0" encoding="utf-8"?>
         <exclude domain="sharedpref" path="SecureStore.xml"/>
     </device-transfer>
 </data-extraction-rules>
+`;
+
+const FILE_PATHS_XML = `<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="apk" path="." />
+</paths>
 `;
 
 const PROGUARD_RULES = `# Expo / React Native ProGuard rules
@@ -104,6 +110,7 @@ function withSecureStoreBackupRules(config) {
         path.join(xmlDir, "secure_store_data_extraction_rules.xml"),
         DATA_EXTRACTION_RULES_XML
       );
+      fs.writeFileSync(path.join(xmlDir, "file_paths.xml"), FILE_PATHS_XML);
 
       // Prevent shrinkResources from stripping icon fonts loaded at runtime
       const rawDir = path.join(platformRoot, "app", "src", "main", "res", "raw");
@@ -115,6 +122,45 @@ function withSecureStoreBackupRules(config) {
       return config;
     },
   ]);
+}
+
+function withApkInstallProvider(config) {
+  return withAndroidManifest(config, (config) => {
+    const manifest = config.modResults.manifest;
+    const permissions = manifest["uses-permission"] ?? [];
+    if (!permissions.some((permission) => permission.$?.["android:name"] === "android.permission.REQUEST_INSTALL_PACKAGES")) {
+      permissions.push({ $: { "android:name": "android.permission.REQUEST_INSTALL_PACKAGES" } });
+      manifest["uses-permission"] = permissions;
+    }
+
+    const application = manifest.application?.[0];
+    if (!application) {
+      throw new Error("Unable to find Android application manifest block.");
+    }
+
+    const providers = application.provider ?? [];
+    if (!providers.some((provider) => provider.$?.["android:authorities"] === "${applicationId}.fileprovider")) {
+      providers.push({
+        $: {
+          "android:name": "androidx.core.content.FileProvider",
+          "android:authorities": "${applicationId}.fileprovider",
+          "android:exported": "false",
+          "android:grantUriPermissions": "true",
+        },
+        "meta-data": [
+          {
+            $: {
+              "android:name": "android.support.FILE_PROVIDER_PATHS",
+              "android:resource": "@xml/file_paths",
+            },
+          },
+        ],
+      });
+      application.provider = providers;
+    }
+
+    return config;
+  });
 }
 
 function withProGuardRules(config) {
@@ -246,6 +292,7 @@ function withBanguminiMediaModule(config) {
 
 module.exports = function withBanguminiConfig(config) {
   config = withSecureStoreBackupRules(config);
+  config = withApkInstallProvider(config);
   config = withProGuardRules(config);
   config = withNdkAbiFilter(config);
   config = withReleaseSigningConfig(config);

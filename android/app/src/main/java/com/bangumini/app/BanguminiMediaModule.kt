@@ -18,16 +18,20 @@ class BanguminiMediaModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun saveImageFromUrl(url: String, albumName: String, promise: Promise) {
-        val context = reactApplicationContext
+        try {
+            val context = reactApplicationContext
 
-        val file = Glide.with(context)
-            .asFile()
-            .load(url)
-            .submit()
-            .get()
+            val file = Glide.with(context)
+                .asFile()
+                .load(url)
+                .submit()
+                .get()
 
-        saveToMediaStore(context, file, albumName)
-        promise.resolve(null)
+            saveToMediaStore(context, file, albumName)
+            promise.resolve(null)
+        } catch (e: Exception) {
+            promise.reject("SAVE_FAILED", e.message)
+        }
     }
 
     @ReactMethod

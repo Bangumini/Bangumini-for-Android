@@ -66,6 +66,21 @@ const todayDateKey = (() => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 })();
 
+async function readCachedAiringTimes(subjectIds: number[]) {
+  const keys = subjectIds.map((id) => `${AIRING_CACHE_PREFIX}${id}`);
+  const [cachedByKey, staleByKey] = await Promise.all([
+    readCachedValuesWithin<AiringTime>(keys, AIRING_TIME_CACHE_MAX_AGE),
+    readCachedValues<AiringTime>(keys),
+  ]);
+  const map = new Map<number, AiringTime>();
+  for (const id of subjectIds) {
+    const key = `${AIRING_CACHE_PREFIX}${id}`;
+    const v = cachedByKey.get(key) ?? staleByKey.get(key);
+    if (v) map.set(id, v);
+  }
+  return map;
+}
+
 async function loadCollections(type: CollectionType, username: string, force = false) {
   const cacheKey = `collections-${type}-${username}`;
   if (!force) {
@@ -74,6 +89,7 @@ async function loadCollections(type: CollectionType, username: string, force = f
     if (cacheHit) {
       await mergeSubjectCollections(cacheHit, username);
       cacheHit.data = cacheHit.data.filter((c) => c.type === type);
+
       return cacheHit;
     }
   }
@@ -308,7 +324,25 @@ export default function CollectionsPage() {
     [airingIds, staleAiringIds],
   );
 
-  // --- Phase 3: AniList airing times (only for watching tab) ---
+  // --- Phase 3: Cached AniList airing times (fast path for offline/first paint) ---
+  const airingTimeCacheIds = useMemo(
+    () => isWatching ? [...new Set(rawCollections.map((item) => item.subject_id))] : [],
+    [rawCollections, isWatching],
+  );
+  const airingTimeCacheKey = airingTimeCacheIds.join(",");
+
+  const {
+    data: cachedAiringTimeMap,
+    isFetched: cachedAiringTimeFetched,
+  } = useQuery({
+    queryKey: ["anilist-airing-times-cache", airingTimeCacheKey],
+    queryFn: () => readCachedAiringTimes(airingTimeCacheIds),
+    enabled: airingTimeCacheIds.length > 0,
+    staleTime: 5 * 60 * 1000,
+    gcTime: CACHE_MAX_AGE * 2,
+  });
+
+  // --- Phase 3b: AniList airing times network backfill (only missing cached items) ---
   const airingTimeTargets = useMemo(() => {
     if (!isWatching) return [];
     const calendarReady = airingMap.size > 0;
@@ -329,21 +363,7 @@ export default function CollectionsPage() {
   const { data: airingTimeMapData } = useQuery({
     queryKey: ["anilist-airing-times", airingTimeTargetKey],
     queryFn: async () => {
-      const map = new Map<number, AiringTime>();
-      const cacheKeys = airingTimeTargets.map((t) => `${AIRING_CACHE_PREFIX}${t.subjectId}`);
-
-      const [cachedByKey, staleByKey] = await Promise.all([
-        readCachedValuesWithin<AiringTime>(cacheKeys, AIRING_TIME_CACHE_MAX_AGE),
-        readCachedValues<AiringTime>(cacheKeys),
-      ]);
-
-      for (const target of airingTimeTargets) {
-        const key = `${AIRING_CACHE_PREFIX}${target.subjectId}`;
-        const cached = cachedByKey.get(key);
-        if (cached) { map.set(target.subjectId, cached); continue; }
-        const stale = staleByKey.get(key);
-        if (stale) map.set(target.subjectId, stale);
-      }
+      const map = new Map<number, AiringTime>(cachedAiringTimeMap);
 
       const missing = airingTimeTargets.filter((t) => !map.has(t.subjectId));
       const AIRING_BATCH_SIZE = 3;
@@ -372,12 +392,21 @@ export default function CollectionsPage() {
       }
       return map;
     },
-    enabled: airingTimeTargets.length > 0,
+    enabled: airingTimeTargets.length > 0 && cachedAiringTimeFetched,
     staleTime: 5 * 60 * 1000,
     gcTime: CACHE_MAX_AGE * 2,
   });
 
-  const airingTimeMap = airingTimeMapData ?? EMPTY_AIRING_TIME_MAP;
+  const airingTimeMap = useMemo(() => {
+    if (!cachedAiringTimeMap && !airingTimeMapData) return EMPTY_AIRING_TIME_MAP;
+    const merged = new Map<number, AiringTime>(cachedAiringTimeMap);
+    if (airingTimeMapData) {
+      for (const [subjectId, airingTime] of airingTimeMapData) {
+        merged.set(subjectId, airingTime);
+      }
+    }
+    return merged;
+  }, [cachedAiringTimeMap, airingTimeMapData]);
 
   const { data: airedEpMap } = useQuery({
     queryKey: ["aired-episodes", todayDateKey, allEpisodeIds.join(",")],

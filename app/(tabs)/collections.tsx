@@ -310,9 +310,12 @@ export default function CollectionsPage() {
 
   // --- Phase 3: AniList airing times (only for watching tab) ---
   const airingTimeTargets = useMemo(() => {
-    if (!isWatching || airingMap.size === 0) return [];
-    if (airingIds.length === 0 && staleAiringIds.length === 0) return [];
-    const targetIds = new Set([...airingIds, ...staleAiringIds]);
+    if (!isWatching) return [];
+    const calendarReady = airingMap.size > 0;
+    if (calendarReady && airingIds.length === 0 && staleAiringIds.length === 0) return [];
+    const targetIds = calendarReady
+      ? new Set([...airingIds, ...staleAiringIds])
+      : new Set(rawCollections.map((item) => item.subject_id));
     return rawCollections
       .filter((item) => targetIds.has(item.subject_id) && item.subject.name)
       .map((item) => ({

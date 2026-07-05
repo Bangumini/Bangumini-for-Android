@@ -9,12 +9,13 @@ import {
   getSubject,
   getSubjectCharacters,
   getSubjectPersons,
+  getSubjectRelations,
   getUserCollection,
   patchSubjectEpisodes,
   postUserCollection,
 } from "../../shared/api/client";
 import { CollectionTypeLabel } from "../../shared/api/types";
-import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, UserCollection } from "../../shared/api/types";
+import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, SubjectRelation, UserCollection } from "../../shared/api/types";
 import {
   deleteCachedCollection,
   getPreferredSubjectCoverUrl,
@@ -23,6 +24,7 @@ import {
   readCachedCollectionWithin,
   readCachedEpisodesWithin,
   readCachedPersonsWithin,
+  readCachedRelationsWithin,
   readCachedSubject,
   readCachedSubjectDeepWithin,
   readCachedValue,
@@ -30,6 +32,7 @@ import {
   writeCachedCollection,
   writeCachedEpisodes,
   writeCachedPersons,
+  writeCachedRelations,
   writeCachedSubject,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
@@ -146,6 +149,42 @@ async function loadCharacters(subjectId: number) {
   return characters;
 }
 
+async function loadRelations(subjectId: number) {
+  const cached = await readCachedRelationsWithin(subjectId, DETAIL_CACHE_MAX_AGE);
+  if (cached) return cached;
+  const relations = await getSubjectRelations(subjectId);
+  await writeCachedRelations(subjectId, relations);
+  return relations;
+}
+
+async function loadArtistMap(relations: SubjectRelation[]): Promise<Record<number, string | null>> {
+  const musicRelations = relations.filter((r) => r.type === 3);
+  const map: Record<number, string | null> = {};
+
+  const results = await Promise.allSettled(
+    musicRelations.map(async (r) => {
+      const cached = await readCachedSubject(r.id);
+      if (cached?.infobox) {
+        return { id: r.id, artist: extractArtist(cached.infobox) };
+      }
+      try {
+        const subject = await getSubject(r.id);
+        await writeCachedSubject(subject);
+        return { id: r.id, artist: extractArtist(subject.infobox) };
+      } catch {
+        return { id: r.id, artist: null };
+      }
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      map[result.value.id] = result.value.artist;
+    }
+  }
+  return map;
+}
+
 function getTotalEpisodes(subject?: Subject | null, episodes?: PagedResponse<Episode> | null) {
   const normalCount = episodes?.data?.filter((episode) => episode.type === 0).length;
   if (normalCount) return normalCount;
@@ -159,6 +198,20 @@ function getAirWeekdayLabel(weekday?: number) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function extractArtist(infobox?: { key: string; value: string | { v: string }[] }[]): string | null {
+  if (!infobox) return null;
+  const artist = infobox.find((i) => i.key === "艺术家");
+  if (artist && typeof artist.value === "string") return artist.value;
+  const lyricist = infobox.find((i) => i.key === "作词");
+  const composer = infobox.find((i) => i.key === "作曲");
+  const parts: string[] = [];
+  if (lyricist && typeof lyricist.value === "string") parts.push(lyricist.value);
+  if (composer && typeof composer.value === "string" && (parts.length === 0 || composer.value !== parts[0])) {
+    parts.push(composer.value);
+  }
+  return parts.length > 0 ? parts.join(" / ") : null;
 }
 
 const SUMMARY_ORIGINAL_MARKER = "[简介原文]";
@@ -263,6 +316,36 @@ export default function SubjectDetailPage() {
     enabled: Number.isFinite(subjectId),
     queryFn: () => loadCharacters(subjectId),
   });
+
+  const relationsQuery = useQuery({
+    queryKey: ["relations", subjectId],
+    enabled: Number.isFinite(subjectId),
+    queryFn: () => loadRelations(subjectId),
+  });
+
+  const songGroups = useMemo(() => {
+    const relations = relationsQuery.data;
+    if (!relations) return null;
+    const ops: SubjectRelation[] = [];
+    const eds: SubjectRelation[] = [];
+    const osts: SubjectRelation[] = [];
+    const characterSongs: SubjectRelation[] = [];
+    for (const r of relations) {
+      if (r.relation === "片头曲") ops.push(r);
+      else if (r.relation === "片尾曲") eds.push(r);
+      else if (r.relation === "原声集") osts.push(r);
+      else if (r.relation === "角色歌") characterSongs.push(r);
+    }
+    return { ops, eds, osts, characterSongs };
+  }, [relationsQuery.data]);
+
+  const artistMapQuery = useQuery({
+    queryKey: ["relations-artists", subjectId, relationsQuery.dataUpdatedAt],
+    enabled: !!relationsQuery.data && relationsQuery.data.length > 0,
+    queryFn: () => loadArtistMap(relationsQuery.data!),
+    staleTime: DETAIL_CACHE_MAX_AGE,
+  });
+  const artistMap = useMemo(() => artistMapQuery.data ?? {}, [artistMapQuery.data]);
 
   // --- Background refresh: fetch network data after showing cache ---
   const lastRefreshedKeyRef = useRef<string | null>(null);
@@ -614,6 +697,57 @@ export default function SubjectDetailPage() {
             </Text>
           </CopyText>
         )) ?? <Text style={styles.muted}>加载中</Text>}
+      </Section>
+
+      <Section title="OP/ED/OST">
+        {relationsQuery.data == null ? (
+          <Text style={styles.muted}>加载中</Text>
+        ) : songGroups ? (
+          <>
+            {songGroups.ops.length > 0 && (
+              <View style={{ gap: 4 }}>
+                <Text style={styles.muted}>片头曲 (OP)</Text>
+                {songGroups.ops.map((r) => (
+                  <CopyText key={r.id} text={r.name_cn || r.name}>
+                    <Text style={styles.line}>{r.name_cn || r.name}{r.name_cn && r.name ? ` / ${r.name}` : ""}{artistMap[r.id] ? ` · ${artistMap[r.id]}` : ""}</Text>
+                  </CopyText>
+                ))}
+              </View>
+            )}
+            {songGroups.eds.length > 0 && (
+              <View style={{ gap: 4, marginTop: songGroups.ops.length > 0 ? 10 : 0 }}>
+                <Text style={styles.muted}>片尾曲 (ED)</Text>
+                {songGroups.eds.map((r) => (
+                  <CopyText key={r.id} text={r.name_cn || r.name}>
+                    <Text style={styles.line}>{r.name_cn || r.name}{r.name_cn && r.name ? ` / ${r.name}` : ""}{artistMap[r.id] ? ` · ${artistMap[r.id]}` : ""}</Text>
+                  </CopyText>
+                ))}
+              </View>
+            )}
+            {songGroups.osts.length > 0 && (
+              <View style={{ gap: 4, marginTop: songGroups.ops.length > 0 || songGroups.eds.length > 0 ? 10 : 0 }}>
+                <Text style={styles.muted}>原声集 (OST)</Text>
+                {songGroups.osts.map((r) => (
+                  <CopyText key={r.id} text={r.name_cn || r.name}>
+                    <Text style={styles.line}>{r.name_cn || r.name}{r.name_cn && r.name ? ` / ${r.name}` : ""}{artistMap[r.id] ? ` · ${artistMap[r.id]}` : ""}</Text>
+                  </CopyText>
+                ))}
+              </View>
+            )}
+            {songGroups.characterSongs.length > 0 && (
+              <View style={{ gap: 4, marginTop: songGroups.ops.length > 0 || songGroups.eds.length > 0 || songGroups.osts.length > 0 ? 10 : 0 }}>
+                <Text style={styles.muted}>角色歌</Text>
+                {songGroups.characterSongs.map((r) => (
+                  <CopyText key={r.id} text={r.name_cn || r.name}>
+                    <Text style={styles.line}>{r.name_cn || r.name}{r.name_cn && r.name ? ` / ${r.name}` : ""}{artistMap[r.id] ? ` · ${artistMap[r.id]}` : ""}</Text>
+                  </CopyText>
+                ))}
+              </View>
+            )}
+          </>
+        ) : (
+          <Text style={styles.muted}>暂无</Text>
+        )}
       </Section>
 
       <Section title="角色 / Cast">

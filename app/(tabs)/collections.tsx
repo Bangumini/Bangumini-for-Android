@@ -355,17 +355,17 @@ export default function CollectionsPage() {
           }),
         );
 
-        let allEmpty = true;
         for (const r of results) {
           if (r.status === "fulfilled" && r.value.result) {
-            allEmpty = false;
             const { target, result } = r.value;
             await writeCachedValue(`${AIRING_CACHE_PREFIX}${target.subjectId}`, result);
             map.set(target.subjectId, result);
           }
         }
 
-        if (allEmpty) break;
+        if (i + AIRING_BATCH_SIZE < missing.length) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
       }
       return map;
     },

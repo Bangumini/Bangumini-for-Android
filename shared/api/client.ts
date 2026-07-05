@@ -47,21 +47,34 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 3): Prom
   throw new Error("unreachable");
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, maxRetries = 3): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const authHeaders = await getAuthHeaders();
   const headers = { ...authHeaders, ...(options.headers || {}) };
 
-  const res = await fetchWithRetry(url, { ...options, headers });
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const res = await fetchWithRetry(url, { ...options, headers });
 
-  if (!res.ok) {
+    if (res.ok) {
+      const text = await res.text();
+      if (!text) return undefined as T;
+      return JSON.parse(text) as T;
+    }
+
     const body = await res.text();
-    throw new Error(`Bangumi API error ${res.status}: ${body}`);
+    lastError = new Error(`Bangumi API error ${res.status}: ${body}`);
+
+    if (res.status >= 500 && res.status < 600 || res.status === 429) {
+      if (attempt < maxRetries - 1) {
+        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        continue;
+      }
+    }
+    throw lastError;
   }
 
-  const text = await res.text();
-  if (!text) return undefined as T;
-  return JSON.parse(text) as T;
+  throw lastError!;
 }
 
 /** Search Bangumi for an anime subject by name, returns first match */

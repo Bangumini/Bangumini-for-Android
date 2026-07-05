@@ -42,6 +42,8 @@ export async function getAccessToken(): Promise<string> {
   if (expiry && Date.now() > Number(expiry)) {
     const refreshed = await refreshAccessToken();
     if (refreshed) return refreshed;
+    await clearToken();
+    throw new Error("Not authenticated");
   }
 
   const token = await getItem(TOKEN_KEY);

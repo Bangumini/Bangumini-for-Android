@@ -148,10 +148,8 @@ export default function ImageViewer({ visible, uri, onClose }: ImageViewerProps)
 
   const longPress = Gesture.LongPress()
     .minDuration(500)
-    .onEnd((_e, success) => {
-      if (success) {
-        runOnJS(handleSave)();
-      }
+    .onStart(() => {
+      runOnJS(handleSave)();
     });
 
   const composed = Gesture.Race(

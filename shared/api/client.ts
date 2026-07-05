@@ -67,7 +67,8 @@ async function request<T>(path: string, options: RequestInit = {}, maxRetries = 
 
     if (res.status >= 500 && res.status < 600 || res.status === 429) {
       if (attempt < maxRetries - 1) {
-        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        const delay = parseRetryDelay(res, body);
+        await new Promise((r) => setTimeout(r, delay));
         continue;
       }
     }
@@ -75,6 +76,22 @@ async function request<T>(path: string, options: RequestInit = {}, maxRetries = 
   }
 
   throw lastError!;
+}
+
+function parseRetryDelay(res: Response, body: string): number {
+  const headerRetry = res.headers.get("Retry-After");
+  if (headerRetry && /^\d+$/.test(headerRetry)) {
+    return Number(headerRetry) * 1000;
+  }
+
+  try {
+    const cf = JSON.parse(body);
+    if (cf?.retry_after && typeof cf.retry_after === "number") {
+      return cf.retry_after * 1000;
+    }
+  } catch { /* ignore */ }
+
+  return 1000 * Math.pow(2, Math.floor(Math.random() * 3));
 }
 
 /** Search Bangumi for an anime subject by name, returns first match */

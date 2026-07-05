@@ -36,10 +36,11 @@ export default function SettingsPage() {
   const [savingToken, setSavingToken] = useState(false);
 
   const [updateStatus, setUpdateStatus] = useState<
-    "idle" | "checking" | "up-to-date" | "available" | "downloading" | "installing" | "error"
+    "idle" | "checking" | "up-to-date" | "available" | "downloading" | "downloaded" | "installing" | "error"
   >("idle");
   const [latestVersion, setLatestVersion] = useState("");
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadedFileUri, setDownloadedFileUri] = useState("");
 
   const appVersion = Constants.expoConfig?.version ?? "0.1.0";
 
@@ -87,8 +88,12 @@ export default function SettingsPage() {
       const info = await checkForUpdate();
       if (info.hasUpdate) {
         setLatestVersion(info.latestVersion);
+        setDownloadedFileUri("");
+        setDownloadProgress(0);
         setUpdateStatus("available");
       } else {
+        setDownloadedFileUri("");
+        setDownloadProgress(0);
         setUpdateStatus("up-to-date");
       }
     } catch {
@@ -102,6 +107,7 @@ export default function SettingsPage() {
 
     setUpdateStatus("downloading");
     setDownloadProgress(0);
+    setDownloadedFileUri("");
 
     try {
       const fileUri = await downloadApk(info.downloadUrl, (progress: DownloadProgress) => {
@@ -110,6 +116,9 @@ export default function SettingsPage() {
           : 0;
         setDownloadProgress(Math.round(pct * 100));
       });
+      setDownloadedFileUri(fileUri);
+      setDownloadProgress(100);
+      setUpdateStatus("downloaded");
 
       alert(
         "下载完成",
@@ -124,10 +133,13 @@ export default function SettingsPage() {
     }
   }
 
-  async function doInstall(fileUri: string) {
+  async function doInstall(fileUri = downloadedFileUri) {
+    if (!fileUri) return;
+
     setUpdateStatus("installing");
     try {
       await installApk(fileUri);
+      setUpdateStatus("downloaded");
     } catch {
       setUpdateStatus("error");
     }
@@ -190,7 +202,7 @@ export default function SettingsPage() {
         <Text style={styles.sectionTitle}>版本更新</Text>
         <SettingsRow
           title={`当前版本 v${appVersion}`}
-          detail={updateStatus === "available" ? `新版本 v${latestVersion}` : undefined}
+          detail={updateStatus === "available" || updateStatus === "downloaded" ? `新版本 v${latestVersion}` : undefined}
         />
         {updateStatus === "idle" && (
           <Pressable style={styles.secondaryButton} onPress={() => void handleCheckUpdate()}>
@@ -222,6 +234,17 @@ export default function SettingsPage() {
             </View>
             <Text style={styles.updateHint}>下载中 {downloadProgress}%</Text>
           </View>
+        )}
+        {updateStatus === "downloaded" && (
+          <>
+            <Text style={styles.updateHint}>下载完成，可以开始安装</Text>
+            <Pressable style={styles.primaryButton} onPress={() => void doInstall()}>
+              <Text style={styles.primaryText}>开始安装</Text>
+            </Pressable>
+            <Pressable style={styles.secondaryButton} onPress={() => void openInstallPermissionSettings()}>
+              <Text style={styles.secondaryText}>安装权限设置</Text>
+            </Pressable>
+          </>
         )}
         {updateStatus === "installing" && (
           <Text style={styles.updateHint}>正在准备安装...</Text>

@@ -239,6 +239,20 @@ function withReleaseSigningConfig(config) {
   });
 }
 
+function withDebugApplicationIdSuffix(config) {
+  return withAppBuildGradle(config, (config) => {
+    let content = config.modResults.contents;
+    if (!content.includes('applicationIdSuffix ".dev"')) {
+      content = content.replace(
+        "        debug {\n            signingConfig signingConfigs.debug\n        }",
+        '        debug {\n            signingConfig signingConfigs.debug\n            applicationIdSuffix ".dev"\n            versionNameSuffix "-dev"\n        }'
+      );
+    }
+    config.modResults.contents = content;
+    return config;
+  });
+}
+
 function withOptimizedBuild(config) {
   return withGradleProperties(config, (config) => {
     const toRemove = new Set(BUILD_PROPS.map((p) => p.key));
@@ -296,6 +310,7 @@ module.exports = function withBanguminiConfig(config) {
   config = withProGuardRules(config);
   config = withNdkAbiFilter(config);
   config = withReleaseSigningConfig(config);
+  config = withDebugApplicationIdSuffix(config);
   config = withOptimizedBuild(config);
   config = withBanguminiMediaModule(config);
   return config;

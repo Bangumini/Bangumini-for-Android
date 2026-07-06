@@ -31,11 +31,17 @@ import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
-const PAGE_SIZE = 20;
+const FIRST_WEEKDAY = 1;
+const LAST_WEEKDAY = 7;
+const WEEKDAY_VALUES = [1, 2, 3, 4, 5, 6, 7];
 
-const WEEKDAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7].map((value) => ({
+function getWeekdayLabel(value: number) {
+  return value === getTodayBangumiWeekday() ? "今天" : WEEKDAY_CN[value].replace("星期", "周");
+}
+
+const WEEKDAY_OPTIONS = WEEKDAY_VALUES.map((value) => ({
   value,
-  label: value === getTodayBangumiWeekday() ? "今天" : WEEKDAY_CN[value].replace("星期", "周"),
+  label: getWeekdayLabel(value),
 }));
 
 type EnrichedItem = SubjectSmall & { weekday: number };
@@ -70,15 +76,18 @@ export default function CalendarPage() {
   const [weekday, setWeekday] = useState(getTodayBangumiWeekday());
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-  const [page, setPage] = useState(1);
 
   const translateX = useSharedValue(0);
   const fadeAnim = useSharedValue(1);
-  const currentPageSV = useSharedValue(1);
-  const totalPagesSV = useSharedValue(1);
+  const currentWeekdaySV = useSharedValue(weekday);
 
-  const goToPrevPage = () => { setPage((p) => Math.max(1, p - 1)); };
-  const goToNextPage = () => { setPage((p) => p + 1); };
+  const goToPrevWeekday = () => {
+    setWeekday((current) => Math.max(FIRST_WEEKDAY, current - 1));
+  };
+
+  const goToNextWeekday = () => {
+    setWeekday((current) => Math.min(LAST_WEEKDAY, current + 1));
+  };
 
   const panGesture = Gesture.Pan()
     .activeOffsetX([-10, 10])
@@ -89,22 +98,22 @@ export default function CalendarPage() {
     .onEnd((e) => {
       "worklet";
       const threshold = 40;
-      if (e.translationX > threshold && currentPageSV.value > 1) {
+      if (e.translationX > threshold && currentWeekdaySV.value > FIRST_WEEKDAY) {
         translateX.value = withTiming(0, { duration: 180 });
         fadeAnim.value = withSequence(
           withTiming(0, { duration: 80 }),
           withTiming(1, { duration: 120 }),
         );
-        currentPageSV.value -= 1;
-        runOnJS(goToPrevPage)();
-      } else if (e.translationX < -threshold && currentPageSV.value < totalPagesSV.value) {
+        currentWeekdaySV.value -= 1;
+        runOnJS(goToPrevWeekday)();
+      } else if (e.translationX < -threshold && currentWeekdaySV.value < LAST_WEEKDAY) {
         translateX.value = withTiming(0, { duration: 180 });
         fadeAnim.value = withSequence(
           withTiming(0, { duration: 80 }),
           withTiming(1, { duration: 120 }),
         );
-        currentPageSV.value += 1;
-        runOnJS(goToNextPage)();
+        currentWeekdaySV.value += 1;
+        runOnJS(goToNextWeekday)();
       } else {
         translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
       }
@@ -189,22 +198,7 @@ export default function CalendarPage() {
 
   const dayItems = day?.items ?? [];
 
-  const totalPages = Math.max(1, Math.ceil(dayItems.length / PAGE_SIZE));
-  const paged = useMemo(
-    () => dayItems.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-    [dayItems, page],
-  );
-
-  useEffect(() => { currentPageSV.value = page; }, [page, currentPageSV]);
-  useEffect(() => { totalPagesSV.value = totalPages; }, [totalPages, totalPagesSV]);
-
-  useEffect(() => {
-    setPage(1);
-  }, [weekday]);
-
-  useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [totalPages, page]);
+  useEffect(() => { currentWeekdaySV.value = weekday; }, [weekday, currentWeekdaySV]);
 
   async function refresh() {
     setRefreshing(true);
@@ -271,9 +265,9 @@ export default function CalendarPage() {
         <GestureDetector gesture={panGesture}>
           <Animated.View style={[animatedStyle, { flex: 1 }]}>
             <FlatList
-              data={paged}
+              data={dayItems}
               keyExtractor={(item) => String(item.id)}
-              contentContainerStyle={paged.length ? styles.list : styles.emptyList}
+              contentContainerStyle={dayItems.length ? styles.list : styles.emptyList}
               refreshControl={
                 <RefreshControl
                   refreshing={refreshing}
@@ -286,9 +280,6 @@ export default function CalendarPage() {
                 dayItems.length > 0 ? (
                   <View style={styles.headerRow}>
                     <Text style={styles.count}>共 {dayItems.length} 条</Text>
-                    <Text style={styles.pageInfo}>
-                      第 {page} / {totalPages} 页
-                    </Text>
                   </View>
                 ) : null
               }
@@ -327,11 +318,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 1,
   },
   count: {
-    color: colors.muted,
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  pageInfo: {
     color: colors.muted,
     fontSize: 13,
     fontWeight: "600",

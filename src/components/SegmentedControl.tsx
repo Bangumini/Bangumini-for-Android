@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { colors } from "../theme/colors";
@@ -18,13 +19,35 @@ export function SegmentedControl<T extends string | number>({
   value,
   onChange,
 }: SegmentedControlProps<T>) {
+  const scrollRef = useRef<ScrollView>(null);
+  const containerWidthRef = useRef(0);
+  const segmentLayoutsRef = useRef(new Map<T, { x: number; width: number }>());
+
+  const scrollActiveIntoView = useCallback((targetValue: T) => {
+    const layout = segmentLayoutsRef.current.get(targetValue);
+    const containerWidth = containerWidthRef.current;
+    if (!layout || containerWidth <= 0) return;
+
+    const x = Math.max(0, layout.x - (containerWidth - layout.width) / 2);
+    scrollRef.current?.scrollTo({ x, animated: true });
+  }, []);
+
+  useEffect(() => {
+    scrollActiveIntoView(value);
+  }, [scrollActiveIntoView, value]);
+
   return (
     <View style={styles.wrapper}>
       <ScrollView
+        ref={scrollRef}
         horizontal
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.container}
         bounces={false}
+        onLayout={(event) => {
+          containerWidthRef.current = event.nativeEvent.layout.width;
+          scrollActiveIntoView(value);
+        }}
       >
         {options.map((option, index) => {
           const active = option.value === value;
@@ -33,6 +56,10 @@ export function SegmentedControl<T extends string | number>({
             <Pressable
               key={String(option.value)}
               onPress={() => onChange(option.value)}
+              onLayout={(event) => {
+                segmentLayoutsRef.current.set(option.value, event.nativeEvent.layout);
+                if (active) scrollActiveIntoView(option.value);
+              }}
               style={[styles.segment, active && styles.activeSegment, !isLast && styles.segmentGap]}
             >
               <Text style={[styles.label, active && styles.activeLabel]} numberOfLines={1}>

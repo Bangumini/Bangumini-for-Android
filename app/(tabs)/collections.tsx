@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   runOnJS,
@@ -12,6 +12,7 @@ import Animated, {
 import * as Clipboard from "expo-clipboard";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Ionicons } from "@expo/vector-icons";
 
 import { getAllUserCollections, getCalendar, getEpisodes } from "../../shared/api/client";
 import { getAiringAt } from "../../shared/api/anilist";
@@ -163,6 +164,18 @@ function matchesSearch(collection: UserCollection, query: string) {
   return haystack.includes(query);
 }
 
+function getTaskStatusLabel(task: CollectionTask) {
+  if (task.status === "failed") return "同步失败";
+  if (task.status === "running") return "同步中";
+  return "等待同步";
+}
+
+function getTaskPriority(task: CollectionTask) {
+  if (task.status === "failed") return 0;
+  if (task.status === "running") return 1;
+  return 2;
+}
+
 export default function CollectionsPage() {
   const alert = useAlert();
   const queryClient = useQueryClient();
@@ -172,6 +185,7 @@ export default function CollectionsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
   const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
+  const [taskPanelExpanded, setTaskPanelExpanded] = useState(false);
 
   // --- Pagination: animated swipe between pages ---
   const translateX = useSharedValue(0);
@@ -266,7 +280,12 @@ export default function CollectionsPage() {
 
   const sourceCollections = collectionsQuery.data?.data ?? [];
   const visibleCollectionTasks = useMemo(
-    () => username ? collectionTasks.filter((task) => task.payload.username === username) : collectionTasks,
+    () => {
+      const tasks = username ? collectionTasks.filter((task) => task.payload.username === username) : collectionTasks;
+      return tasks
+        .slice()
+        .sort((a, b) => getTaskPriority(a) - getTaskPriority(b) || a.createdAt - b.createdAt);
+    },
     [collectionTasks, username],
   );
   const rawCollections = useMemo(
@@ -630,6 +649,12 @@ export default function CollectionsPage() {
     if (page > totalPages) setPage(totalPages);
   }, [totalPages, page]);
 
+  useEffect(() => {
+    if (visibleCollectionTasks.length === 0) {
+      setTaskPanelExpanded(false);
+    }
+  }, [visibleCollectionTasks.length]);
+
   async function refresh() {
     if (!username) return;
     setRefreshing(true);
@@ -658,11 +683,10 @@ export default function CollectionsPage() {
   }
 
   const collectionTask = visibleCollectionTasks[0];
-  const collectionTaskStatus = collectionTask?.status === "failed"
-    ? "同步失败"
-    : collectionTask?.status === "running"
-    ? "同步中"
-    : "等待同步";
+  const listContentStyle = [
+    paged.length ? styles.list : styles.emptyList,
+    collectionTask ? (taskPanelExpanded ? styles.listWithExpandedTaskDock : styles.listWithTaskDock) : null,
+  ];
 
   if (checking) return <LoadingState label="检查登录状态" />;
   if (!loggedIn) return <LoadingState label="跳转登录" />;
@@ -675,32 +699,6 @@ export default function CollectionsPage() {
         onChange={setCollectionType}
       />
       <SearchInput value={search} onChangeText={setSearch} placeholder={`搜索${CollectionTypeLabel[collectionType]}`} />
-
-      {collectionTask ? (
-        <View style={styles.taskBar}>
-          <View style={styles.taskInfo}>
-            <Text style={styles.taskTitle} numberOfLines={1}>
-              {getCollectionTaskSummary(collectionTask)} · {collectionTaskStatus}
-            </Text>
-            {collectionTask.status === "failed" && collectionTask.lastError ? (
-              <Text style={styles.taskError} numberOfLines={1}>{collectionTask.lastError}</Text>
-            ) : null}
-            {visibleCollectionTasks.length > 1 ? (
-              <Text style={styles.taskMeta}>另有 {visibleCollectionTasks.length - 1} 个后台任务</Text>
-            ) : null}
-          </View>
-          {collectionTask.status === "failed" ? (
-            <Pressable style={styles.taskButton} onPress={() => void retryCollectionTask(collectionTask.id)}>
-              <Text style={styles.taskButtonText}>重试</Text>
-            </Pressable>
-          ) : null}
-          {collectionTask.status !== "running" ? (
-            <Pressable style={styles.taskButton} onPress={() => void ignoreCollectionTask(collectionTask.id)}>
-              <Text style={styles.taskButtonMuted}>忽略</Text>
-            </Pressable>
-          ) : null}
-        </View>
-      ) : null}
 
       {collectionsQuery.isLoading ? (
         <LoadingState label="加载收藏" />
@@ -715,7 +713,7 @@ export default function CollectionsPage() {
             <FlatList
               data={paged}
               keyExtractor={(item) => String(item.subject_id)}
-              contentContainerStyle={paged.length ? styles.list : styles.emptyList}
+              contentContainerStyle={listContentStyle}
               refreshControl={
                 <RefreshControl
                   refreshing={refreshing}
@@ -761,9 +759,78 @@ export default function CollectionsPage() {
                   );
                 }}
               />
-            </Animated.View>
-          </GestureDetector>
+          </Animated.View>
+        </GestureDetector>
       )}
+
+      {collectionTask ? (
+        <View pointerEvents="box-none" style={styles.taskDock}>
+          <View style={[styles.taskCapsule, taskPanelExpanded && styles.taskPanel]}>
+            <Pressable
+              style={styles.taskHeader}
+              onPress={() => setTaskPanelExpanded((value) => !value)}
+            >
+              <View style={[
+                styles.taskIcon,
+                collectionTask.status === "failed" && styles.taskIconDanger,
+                collectionTask.status === "running" && styles.taskIconActive,
+              ]}>
+                <Ionicons
+                  name={collectionTask.status === "failed" ? "alert-circle" : collectionTask.status === "running" ? "sync" : "time-outline"}
+                  size={16}
+                  color={collectionTask.status === "failed" ? colors.danger : colors.primary}
+                />
+              </View>
+              <View style={styles.taskHeaderText}>
+                <Text style={styles.taskTitle} numberOfLines={1}>
+                  {getCollectionTaskSummary(collectionTask)}
+                </Text>
+                <Text style={[styles.taskMeta, collectionTask.status === "failed" && styles.taskError]} numberOfLines={1}>
+                  {getTaskStatusLabel(collectionTask)}
+                  {visibleCollectionTasks.length > 1 ? ` · 共 ${visibleCollectionTasks.length} 个任务` : ""}
+                </Text>
+              </View>
+              {visibleCollectionTasks.length > 1 ? (
+                <View style={styles.taskCountPill}>
+                  <Text style={styles.taskCountText}>{visibleCollectionTasks.length}</Text>
+                </View>
+              ) : null}
+              <Ionicons
+                name={taskPanelExpanded ? "chevron-down" : "chevron-up"}
+                size={18}
+                color={colors.muted}
+              />
+            </Pressable>
+
+            {taskPanelExpanded ? (
+              <ScrollView style={styles.taskList} contentContainerStyle={styles.taskListContent}>
+                {visibleCollectionTasks.map((task) => (
+                  <View key={task.id} style={styles.taskItem}>
+                    <View style={styles.taskItemText}>
+                      <Text style={styles.taskItemTitle} numberOfLines={1}>
+                        {getCollectionTaskSummary(task)}
+                      </Text>
+                      <Text style={[styles.taskItemMeta, task.status === "failed" && styles.taskError]} numberOfLines={1}>
+                        {task.status === "failed" && task.lastError ? task.lastError : getTaskStatusLabel(task)}
+                      </Text>
+                    </View>
+                    {task.status === "failed" ? (
+                      <Pressable style={styles.taskActionButton} onPress={() => void retryCollectionTask(task.id)}>
+                        <Ionicons name="refresh" size={15} color={colors.primary} />
+                      </Pressable>
+                    ) : null}
+                    {task.status !== "running" ? (
+                      <Pressable style={styles.taskActionButton} onPress={() => void ignoreCollectionTask(task.id)}>
+                        <Ionicons name="close" size={16} color={colors.muted} />
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ))}
+              </ScrollView>
+            ) : null}
+          </View>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -773,65 +840,139 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
-  taskBar: {
+  list: {
+    padding: 16,
+    paddingTop: 4,
+    paddingBottom: 28,
+  },
+  listWithTaskDock: {
+    paddingBottom: 104,
+  },
+  listWithExpandedTaskDock: {
+    paddingBottom: 238,
+  },
+  emptyList: {
+    flexGrow: 1,
+    padding: 16,
+  },
+  taskDock: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    bottom: 14,
+  },
+  taskCapsule: {
+    borderRadius: 24,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceAlt,
+    shadowColor: "#000",
+    shadowOpacity: 0.28,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 14,
+    overflow: "hidden",
+  },
+  taskPanel: {
+    borderRadius: 18,
+  },
+  taskHeader: {
+    minHeight: 58,
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
+    gap: 10,
     paddingHorizontal: 12,
-    paddingVertical: 9,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: colors.surface,
+    paddingVertical: 10,
   },
-  taskInfo: {
+  taskIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.chip,
+  },
+  taskIconActive: {
+    backgroundColor: colors.primaryMuted,
+  },
+  taskIconDanger: {
+    backgroundColor: "#3a2429",
+  },
+  taskHeaderText: {
     flex: 1,
     minWidth: 0,
   },
   taskTitle: {
     color: colors.text,
     fontSize: 13,
-    fontWeight: "700",
-  },
-  taskError: {
-    marginTop: 2,
-    color: colors.danger,
-    fontSize: 12,
+    fontWeight: "800",
   },
   taskMeta: {
     marginTop: 2,
     color: colors.muted,
     fontSize: 12,
+    fontWeight: "600",
   },
-  taskButton: {
-    minWidth: 48,
+  taskError: {
+    color: colors.danger,
+  },
+  taskCountPill: {
+    minWidth: 24,
+    height: 24,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 7,
+    borderRadius: 12,
+    backgroundColor: colors.chip,
+  },
+  taskCountText: {
+    color: colors.primary,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  taskList: {
+    maxHeight: 220,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+  },
+  taskListContent: {
+    gap: 7,
+    padding: 8,
+  },
+  taskItem: {
+    minHeight: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingLeft: 10,
+    paddingRight: 6,
+    paddingVertical: 7,
+    borderRadius: 12,
+    backgroundColor: colors.surface,
+  },
+  taskItemText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  taskItemTitle: {
+    color: colors.text,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  taskItemMeta: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 11,
+  },
+  taskActionButton: {
+    width: 32,
     height: 32,
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: 10,
-    borderRadius: 7,
+    borderRadius: 16,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
     backgroundColor: colors.background,
-  },
-  taskButtonText: {
-    color: colors.primary,
-    fontSize: 13,
-    fontWeight: "800",
-  },
-  taskButtonMuted: {
-    color: colors.muted,
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  list: {
-    padding: 16,
-    paddingTop: 4,
-    paddingBottom: 28,
-  },
-  emptyList: {
-    flexGrow: 1,
-    padding: 16,
   },
   separator: {
     height: 10,

@@ -1,5 +1,5 @@
 import { Component, useCallback, useEffect, useState, type ReactNode } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { Stack } from "expo-router";
 import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
@@ -10,7 +10,9 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { getAccessToken } from "../src/api/oauth";
+import { startCollectionTaskWorker } from "../src/api/collection-tasks";
 import { DialogProvider } from "../src/components/Dialog";
+import { useAuth } from "../src/hooks/useAuth";
 import { colors } from "../src/theme/colors";
 import { setTokenProvider } from "../shared/api/client";
 
@@ -47,6 +49,19 @@ class RootErrorBoundary extends Component<{ children: ReactNode }, RootErrorBoun
 
     return this.props.children;
   }
+}
+
+function CollectionTaskWorkerBootstrap() {
+  const queryClient = useQueryClient();
+  const { checking, loggedIn } = useAuth();
+
+  useEffect(() => {
+    if (!checking && loggedIn) {
+      startCollectionTaskWorker(queryClient);
+    }
+  }, [checking, loggedIn, queryClient]);
+
+  return null;
 }
 
 export default function RootLayout() {
@@ -88,6 +103,7 @@ export default function RootLayout() {
         <SafeAreaProvider>
           <QueryClientProvider client={queryClient}>
             <DialogProvider>
+              <CollectionTaskWorkerBootstrap />
               <StatusBar style="light" />
               <Stack
               screenOptions={{

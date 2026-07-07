@@ -11,8 +11,6 @@ import {
   getSubjectPersons,
   getSubjectRelations,
   getUserCollection,
-  patchSubjectEpisodes,
-  postUserCollection,
 } from "../../shared/api/client";
 import { CollectionTypeLabel } from "../../shared/api/types";
 import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, SubjectRelation, UserCollection } from "../../shared/api/types";
@@ -27,15 +25,22 @@ import {
   readCachedRelationsWithin,
   readCachedSubject,
   readCachedSubjectDeepWithin,
-  readCachedValue,
   writeCachedCharacters,
   writeCachedCollection,
   writeCachedEpisodes,
   writeCachedPersons,
   writeCachedRelations,
   writeCachedSubject,
-  writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
+import {
+  enqueueCompleteProgressTask,
+  enqueueSetCollectionTypeTask,
+  getCollectionTaskQueue,
+  getOptimisticCollectionPatchForSubject,
+  startCollectionTaskWorker,
+  subscribeCollectionTaskQueue,
+  type CollectionTask,
+} from "../../src/api/collection-tasks";
 import CachedImage from "../../src/components/CachedImage";
 import ImageViewer from "../../src/components/ImageViewer";
 import { EmptyState, LoadingState } from "../../src/components/ScreenState";
@@ -235,25 +240,6 @@ function getSummaryBlocks(summary: string): SummaryBlock[] {
   return blocks;
 }
 
-function upsertCollection(list: PagedResponse<UserCollection>, collection: UserCollection): PagedResponse<UserCollection> {
-  const data = [...list.data];
-  const idx = data.findIndex((c) => c.subject_id === collection.subject_id);
-  if (idx >= 0) {
-    data[idx] = collection;
-  } else {
-    data.unshift(collection);
-  }
-  return { ...list, data, total: list.total + (idx >= 0 ? 0 : 1) };
-}
-
-function removeCollection(list: PagedResponse<UserCollection>, subjectId: number): PagedResponse<UserCollection> {
-  const idx = list.data.findIndex((c) => c.subject_id === subjectId);
-  if (idx < 0) return list;
-  const data = [...list.data];
-  data.splice(idx, 1);
-  return { ...list, data, total: list.total - 1 };
-}
-
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <View style={styles.section}>
@@ -273,6 +259,13 @@ export default function SubjectDetailPage() {
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [viewerVisible, setViewerVisible] = useState(false);
+  const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
+
+  useEffect(() => {
+    if (!checking && loggedIn) {
+      startCollectionTaskWorker(queryClient);
+    }
+  }, [checking, loggedIn, queryClient]);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -410,64 +403,103 @@ export default function SubjectDetailPage() {
     return () => { cancelled = true; };
   }, [subjectId, username, subjectQuery.data, collectionQuery.data]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const syncCollectionTasks = () => {
+      void getCollectionTaskQueue().then((tasks) => {
+        if (!cancelled) setCollectionTasks(tasks);
+      });
+    };
+
+    syncCollectionTasks();
+    const unsubscribe = subscribeCollectionTaskQueue(syncCollectionTasks);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
   const subject = subjectQuery.data;
   const episodes = episodesQuery.data;
   const collection = collectionQuery.data;
   const totalEp = getTotalEpisodes(subject, episodes);
-  const currentEp = collection?.ep_status ?? 0;
+  const subjectCollectionTasks = useMemo(
+    () => collectionTasks.filter((task) => task.payload.subjectId === subjectId),
+    [collectionTasks, subjectId],
+  );
+  const optimisticCollectionPatch = useMemo(
+    () => getOptimisticCollectionPatchForSubject(subjectId, collectionTasks),
+    [collectionTasks, subjectId],
+  );
+  const activeCollectionTask = subjectCollectionTasks.find((task) => task.status === "pending" || task.status === "running");
+  const failedCollectionTask = subjectCollectionTasks.find((task) => task.status === "failed");
+  const currentEp = optimisticCollectionPatch?.ep_status ?? collection?.ep_status ?? 0;
+  const currentCollectionType = optimisticCollectionPatch?.type ?? collection?.type;
   const displayEp = targetEp ?? currentEp;
   const isDirty = targetEp !== null && targetEp !== currentEp;
   const progress = totalEp > 0 ? displayEp / totalEp : 0;
+  const hasKnownTotalEp = totalEp > 0;
+  const canDecreaseProgress = displayEp > 0;
+  const canIncreaseProgress = !hasKnownTotalEp || displayEp < totalEp;
 
   useEffect(() => {
     setTargetEp(null);
-  }, [collection?.ep_status, subjectId]);
+  }, [currentEp, subjectId]);
+
+  useEffect(() => {
+    if (targetEp !== null && hasKnownTotalEp && targetEp > totalEp) {
+      setTargetEp(totalEp);
+    }
+  }, [hasKnownTotalEp, targetEp, totalEp]);
 
   const summaryBlocks = useMemo(
     () => (subject?.summary ? getSummaryBlocks(subject.summary) : []),
     [subject?.summary],
   );
 
-  async function refreshCollection() {
-    if (!username) return null;
-    const next = await loadCollection(username, subjectId, true);
-    queryClient.setQueryData(["collection", username, subjectId], next);
-    return next;
+  function getTaskSubjectTitle() {
+    return subject?.name_cn || subject?.name || `#${subjectId}`;
   }
 
-  async function syncCollectionsCache(previousType?: CollectionType) {
-    if (!username) return;
-    const next = queryClient.getQueryData<UserCollection>(["collection", username, subjectId]);
-    if (!next) return;
+  function rememberQueuedTask(task: CollectionTask | null) {
+    if (!task) return;
+    setCollectionTasks((prev) => [
+      task,
+      ...prev.filter((item) => item.id !== task.id),
+    ]);
+  }
 
-    const newKey: [string, number, string] = ["collections", next.type, username];
-    queryClient.setQueryData<PagedResponse<UserCollection>>(
-      newKey,
-      (old) => old ? upsertCollection(old, next) : old,
-    );
+  function confirmCanQueueProgress(): Promise<boolean> {
+    if (currentCollectionType === 3) return Promise.resolve(true);
 
-    if (previousType !== undefined && previousType !== next.type) {
-      queryClient.setQueryData<PagedResponse<UserCollection>>(
-        ["collections", previousType, username],
-        (old) => old ? removeCollection(old, next.subject_id) : old,
+    return new Promise((resolve) => {
+      const currentLabel = currentCollectionType ? CollectionTypeLabel[currentCollectionType] : null;
+      alert(
+        currentLabel ? "切换到「在看」？" : "收藏并切换到「在看」？",
+        currentLabel
+          ? `当前收藏状态为「${currentLabel}」，需要切换到「在看」才能更新进度`
+          : "更新观看进度需要先将条目以「在看」状态收藏",
+        [
+          { text: "取消", style: "cancel", onPress: () => resolve(false) },
+          { text: currentLabel ? "切换" : "收藏", onPress: () => resolve(true) },
+        ],
       );
-    }
+    });
+  }
 
-    const cacheKey = `collections-${next.type}-${username}`;
-    const cached = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
-    if (cached?.data) {
-      await writeCachedValue(cacheKey, upsertCollection(cached, next));
-    }
+  function confirmMarkWatchedAfterSave(progressTarget: number): Promise<boolean> {
+    if (progressTarget < totalEp || totalEp <= 0) return Promise.resolve(false);
 
-    if (previousType !== undefined && previousType !== next.type) {
-      const oldCacheKey = `collections-${previousType}-${username}`;
-      const oldCached = await readCachedValue<PagedResponse<UserCollection>>(oldCacheKey);
-      if (oldCached?.data) {
-        await writeCachedValue(oldCacheKey, removeCollection(oldCached, next.subject_id));
-      }
-    }
-
-    await queryClient.invalidateQueries({ queryKey: ["collections"] });
+    return new Promise((resolve) => {
+      alert(
+        "保存后标记为看过？",
+        `观看进度将保存为 ${progressTarget} / ${totalEp} 集，是否在保存成功后标记为「看过」？`,
+        [
+          { text: "仅保存进度", style: "cancel", onPress: () => resolve(false) },
+          { text: "保存并标记", onPress: () => resolve(true) },
+        ],
+      );
+    });
   }
 
   async function changeCollectionType(type: CollectionType) {
@@ -475,16 +507,21 @@ export default function SubjectDetailPage() {
       router.push("/login");
       return;
     }
+    if (currentCollectionType === type) return;
 
-    const prevType = collection?.type;
     setSaving(true);
     try {
-      await postUserCollection(subjectId, { type });
-      const next = await refreshCollection();
-      if (next) await writeCachedCollection(username, next);
-      await syncCollectionsCache(prevType);
+      const queued = await enqueueSetCollectionTypeTask({
+        username,
+        subjectId,
+        subjectTitle: getTaskSubjectTitle(),
+        previousType: collection?.type,
+        nextType: type,
+      });
+      if (!queued) throw new Error("无法创建后台任务");
+      rememberQueuedTask(queued);
     } catch (error) {
-      alert("保存失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("任务创建失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setSaving(false);
     }
@@ -497,50 +534,29 @@ export default function SubjectDetailPage() {
     }
     if (!isDirty || targetEp === null) return;
 
-    const prevType = collection?.type;
+    const ok = await confirmCanQueueProgress();
+    if (!ok) return;
+
+    const progressTarget = targetEp;
+    const markWatched = await confirmMarkWatchedAfterSave(progressTarget);
+
     setSaving(true);
     try {
-      if (!collection || collection.type !== 3) {
-        await postUserCollection(subjectId, { type: 3 });
-      }
-
-      const episodePayload = episodes ?? await loadEpisodes(subjectId, true);
-      const from = Math.min(currentEp, targetEp);
-      const to = Math.max(currentEp, targetEp);
-      const ids = episodePayload.data
-        .slice()
-        .sort((a, b) => a.sort - b.sort)
-        .filter((episode) => episode.type === 0)
-        .slice(from, to)
-        .map((episode) => episode.id);
-
-      if (ids.length === 0 && from !== to) {
-        throw new Error("剧集列表尚未准备好");
-      }
-
-      if (ids.length > 0) {
-        await patchSubjectEpisodes(subjectId, {
-          episode_id: ids,
-          type: targetEp > currentEp ? 2 : 0,
-        });
-      }
-
-      const next = await refreshCollection();
-      if (next) await writeCachedCollection(username, next);
+      const queued = await enqueueCompleteProgressTask({
+        username,
+        subjectId,
+        subjectTitle: getTaskSubjectTitle(),
+        targetEp: progressTarget,
+        totalEp,
+        ensureWatching: currentCollectionType !== 3,
+        markWatched,
+        previousType: collection?.type,
+      });
+      if (!queued) throw new Error("无法创建后台任务");
+      rememberQueuedTask(queued);
       setTargetEp(null);
-
-      if (prevType !== undefined && prevType !== 3) {
-        await syncCollectionsCache(prevType);
-      }
-
-      if (targetEp >= totalEp && totalEp > 0) {
-        alert("标记为看过？", `进度已达 ${totalEp} 集，是否把收藏状态改为「看过」？`, [
-          { text: "暂不", style: "cancel" },
-          { text: "标记", onPress: () => void changeCollectionType(2) },
-        ]);
-      }
     } catch (error) {
-      alert("进度保存失败", error instanceof Error ? error.message : "请稍后重试");
+      alert("任务创建失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {
       setSaving(false);
     }
@@ -623,7 +639,7 @@ export default function SubjectDetailPage() {
         {checking ? <Text style={styles.muted}>检查登录状态</Text> : null}
         <View style={styles.optionRow}>
           {COLLECTION_OPTIONS.map((type) => {
-            const active = collection?.type === type;
+            const active = currentCollectionType === type;
             return (
               <Pressable
                 key={type}
@@ -643,23 +659,35 @@ export default function SubjectDetailPage() {
       <Section title="观看进度">
         <View style={styles.progressHeader}>
           <Text style={styles.progressText}>{displayEp} / {totalEp || "?"}</Text>
-          <Text style={styles.muted}>{isDirty ? "待提交" : collection ? "已同步" : "未收藏"}</Text>
+          <Text style={[styles.muted, failedCollectionTask && !isDirty ? styles.dangerText : null]}>
+            {isDirty
+              ? "待提交"
+              : activeCollectionTask
+              ? "同步中"
+              : failedCollectionTask
+              ? "同步失败"
+              : collection
+              ? "已同步"
+              : currentCollectionType
+              ? "等待同步"
+              : "未收藏"}
+          </Text>
         </View>
         <View style={styles.progressTrack}>
           <View style={[styles.progressFill, { width: `${clamp(progress, 0, 1) * 100}%` }]} />
         </View>
         <View style={styles.stepRow}>
           <Pressable
-            style={styles.stepButton}
-            disabled={saving}
-            onPress={() => setTargetEp(clamp(displayEp - 1, 0, Math.max(totalEp, displayEp)))}
+            style={[styles.stepButton, (saving || !canDecreaseProgress) && styles.disabledButton]}
+            disabled={saving || !canDecreaseProgress}
+            onPress={() => setTargetEp(Math.max(0, displayEp - 1))}
           >
             <Text style={styles.stepText}>-</Text>
           </Pressable>
           <Pressable
-            style={styles.stepButton}
-            disabled={saving}
-            onPress={() => setTargetEp(clamp(displayEp + 1, 0, Math.max(totalEp, displayEp + 1)))}
+            style={[styles.stepButton, (saving || !canIncreaseProgress) && styles.disabledButton]}
+            disabled={saving || !canIncreaseProgress}
+            onPress={() => setTargetEp(hasKnownTotalEp ? clamp(displayEp + 1, 0, totalEp) : displayEp + 1)}
           >
             <Text style={styles.stepText}>+</Text>
           </Pressable>
@@ -668,7 +696,7 @@ export default function SubjectDetailPage() {
             disabled={!isDirty || saving}
             onPress={() => void submitProgress()}
           >
-            <Text style={styles.submitText}>{saving ? "保存中" : "提交"}</Text>
+            <Text style={styles.submitText}>{saving ? "创建中" : "提交"}</Text>
           </Pressable>
         </View>
       </Section>
@@ -928,6 +956,9 @@ const styles = StyleSheet.create({
   muted: {
     color: colors.muted,
     fontSize: 14,
+  },
+  dangerText: {
+    color: colors.danger,
   },
   linkButton: {
     height: 44,

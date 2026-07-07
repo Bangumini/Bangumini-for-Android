@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   runOnJS,
@@ -33,6 +33,16 @@ import {
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
 import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
+import {
+  getCollectionTaskQueue,
+  getCollectionTaskSummary,
+  getOptimisticCollectionPatchForSubject,
+  ignoreCollectionTask,
+  retryCollectionTask,
+  startCollectionTaskWorker,
+  subscribeCollectionTaskQueue,
+  type CollectionTask,
+} from "../../src/api/collection-tasks";
 import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
@@ -161,6 +171,7 @@ export default function CollectionsPage() {
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
+  const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
 
   // --- Pagination: animated swipe between pages ---
   const translateX = useSharedValue(0);
@@ -215,6 +226,28 @@ export default function CollectionsPage() {
     if (!checking && !loggedIn) router.replace("/login");
   }, [checking, loggedIn]);
 
+  useEffect(() => {
+    if (!checking && loggedIn) {
+      startCollectionTaskWorker(queryClient);
+    }
+  }, [checking, loggedIn, queryClient]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const syncCollectionTasks = () => {
+      void getCollectionTaskQueue().then((tasks) => {
+        if (!cancelled) setCollectionTasks(tasks);
+      });
+    };
+
+    syncCollectionTasks();
+    const unsubscribe = subscribeCollectionTaskQueue(syncCollectionTasks);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
   const collectionsQuery = useQuery({
     queryKey: ["collections", collectionType, username],
     enabled: loggedIn && !!username,
@@ -231,7 +264,20 @@ export default function CollectionsPage() {
   const today = getTodayBangumiWeekday();
   const searchQuery = search.trim().toLowerCase();
 
-  const rawCollections = collectionsQuery.data?.data ?? [];
+  const sourceCollections = collectionsQuery.data?.data ?? [];
+  const visibleCollectionTasks = useMemo(
+    () => username ? collectionTasks.filter((task) => task.payload.username === username) : collectionTasks,
+    [collectionTasks, username],
+  );
+  const rawCollections = useMemo(
+    () => sourceCollections
+      .map((collection) => {
+        const patch = getOptimisticCollectionPatchForSubject(collection.subject_id, visibleCollectionTasks);
+        return patch ? { ...collection, ...patch } : collection;
+      })
+      .filter((collection) => collection.type === collectionType),
+    [sourceCollections, visibleCollectionTasks, collectionType],
+  );
   const isWatching = collectionType === 3;
 
   // --- Phase 1: Backfill total_episodes from SQLite cache ---
@@ -611,6 +657,13 @@ export default function CollectionsPage() {
     alert("已复制", title);
   }
 
+  const collectionTask = visibleCollectionTasks[0];
+  const collectionTaskStatus = collectionTask?.status === "failed"
+    ? "同步失败"
+    : collectionTask?.status === "running"
+    ? "同步中"
+    : "等待同步";
+
   if (checking) return <LoadingState label="检查登录状态" />;
   if (!loggedIn) return <LoadingState label="跳转登录" />;
 
@@ -622,6 +675,32 @@ export default function CollectionsPage() {
         onChange={setCollectionType}
       />
       <SearchInput value={search} onChangeText={setSearch} placeholder={`搜索${CollectionTypeLabel[collectionType]}`} />
+
+      {collectionTask ? (
+        <View style={styles.taskBar}>
+          <View style={styles.taskInfo}>
+            <Text style={styles.taskTitle} numberOfLines={1}>
+              {getCollectionTaskSummary(collectionTask)} · {collectionTaskStatus}
+            </Text>
+            {collectionTask.status === "failed" && collectionTask.lastError ? (
+              <Text style={styles.taskError} numberOfLines={1}>{collectionTask.lastError}</Text>
+            ) : null}
+            {visibleCollectionTasks.length > 1 ? (
+              <Text style={styles.taskMeta}>另有 {visibleCollectionTasks.length - 1} 个后台任务</Text>
+            ) : null}
+          </View>
+          {collectionTask.status === "failed" ? (
+            <Pressable style={styles.taskButton} onPress={() => void retryCollectionTask(collectionTask.id)}>
+              <Text style={styles.taskButtonText}>重试</Text>
+            </Pressable>
+          ) : null}
+          {collectionTask.status !== "running" ? (
+            <Pressable style={styles.taskButton} onPress={() => void ignoreCollectionTask(collectionTask.id)}>
+              <Text style={styles.taskButtonMuted}>忽略</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
 
       {collectionsQuery.isLoading ? (
         <LoadingState label="加载收藏" />
@@ -693,6 +772,57 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  taskBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  taskInfo: {
+    flex: 1,
+    minWidth: 0,
+  },
+  taskTitle: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  taskError: {
+    marginTop: 2,
+    color: colors.danger,
+    fontSize: 12,
+  },
+  taskMeta: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 12,
+  },
+  taskButton: {
+    minWidth: 48,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+  },
+  taskButtonText: {
+    color: colors.primary,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  taskButtonMuted: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: "700",
   },
   list: {
     padding: 16,

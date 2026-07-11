@@ -79,7 +79,6 @@ export default function SettingsPage() {
   async function signOut() {
     await logout();
     queryClient.clear();
-    router.replace("/login");
   }
 
   async function handleCheckUpdate() {

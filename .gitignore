@@ -21,3 +21,5 @@ yarn-error.log*
 .env*
 .omo/
 AGENTS.md
+CONTEXT.md
+docs/adr

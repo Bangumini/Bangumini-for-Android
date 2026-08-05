@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-	FlatList,
+	SectionList,
 	Pressable,
 	RefreshControl,
 	ScrollView,
@@ -39,9 +39,14 @@ import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import {
 	getDisplayLabel,
 	getTodayBangumiWeekday,
+	GROUP_COLOR,
+	GROUP_LABEL,
 	sortCollections,
 } from "../../shared/sort-collections";
-import type { SortedCollection } from "../../shared/sort-collections";
+import type {
+	SortedCollection,
+	SortedGroup,
+} from "../../shared/sort-collections";
 import {
 	getPreferredSubjectCoverUrl,
 	readCachedCollection,
@@ -92,6 +97,15 @@ const EMPTY_AIRING_TIME_MAP = new Map<
 const EMPTY_EPISODE_MAP = new Map<number, number>();
 
 type AiringTime = { airingAt: number; episode: number };
+
+/** 分组 section（仅在看 tab 使用；跨页延续的组在后续页仍渲染组头） */
+interface CollectionSection {
+	group?: SortedGroup;
+	title?: string;
+	color?: string;
+	count?: number;
+	data: SortedCollection[];
+}
 
 const COLLECTION_OPTIONS: Array<{ value: CollectionType; label: string }> = [
 	{ value: 3, label: "在看" },
@@ -780,6 +794,40 @@ export default function CollectionsPage() {
 		[collections, page],
 	);
 
+	// --- Grouped sections for the watching tab ---
+	// 组计数取全量（搜索过滤后）而非本页，翻页时组头信息保持稳定
+	const groupCounts = useMemo(() => {
+		const map = new Map<SortedGroup, number>();
+		for (const sc of collections) {
+			map.set(sc.group, (map.get(sc.group) ?? 0) + 1);
+		}
+		return map;
+	}, [collections]);
+
+	const sections = useMemo<CollectionSection[]>(() => {
+		// 非在看 tab：单 section 平铺，不渲染组头
+		if (!isWatching) {
+			return [{ data: paged }];
+		}
+		const result: CollectionSection[] = [];
+		for (const item of paged) {
+			const last = result[result.length - 1];
+			if (last && last.group === item.group) {
+				last.data.push(item);
+			} else {
+				// 每页首个 section 无条件带组头：跨页延续的组在后续页也能看到组名
+				result.push({
+					group: item.group,
+					title: GROUP_LABEL[item.group],
+					color: GROUP_COLOR[item.group],
+					count: groupCounts.get(item.group) ?? 0,
+					data: [item],
+				});
+			}
+		}
+		return result;
+	}, [paged, isWatching, groupCounts]);
+
 	// Keep shared values in sync for worklet access
 	useEffect(() => {
 		currentPageSV.value = page;
@@ -874,8 +922,8 @@ export default function CollectionsPage() {
 			) : (
 				<GestureDetector gesture={panGesture}>
 					<Animated.View style={[animatedStyle, { flex: 1 }]}>
-						<FlatList
-							data={paged}
+						<SectionList
+							sections={sections}
 							keyExtractor={(item) => String(item.collection.subject_id)}
 							contentContainerStyle={listContentStyle}
 							refreshControl={
@@ -908,6 +956,28 @@ export default function CollectionsPage() {
 									detail="调整搜索词或切换收藏类型"
 								/>
 							}
+							renderSectionHeader={
+								isWatching
+									? ({ section }) => {
+											const s = section as CollectionSection;
+											if (!s.group) return null;
+											return (
+												<View style={styles.groupHeader}>
+													<View
+														style={[
+															styles.groupHeaderBar,
+															{ backgroundColor: s.color },
+														]}
+													/>
+													<Text style={styles.groupHeaderTitle}>{s.title}</Text>
+													<Text style={styles.groupHeaderCount}>
+														· {s.count}
+													</Text>
+												</View>
+											);
+										}
+									: undefined
+							}
 							renderItem={({ item }) => {
 								const c = item.collection;
 								const subject = c.subject;
@@ -921,6 +991,9 @@ export default function CollectionsPage() {
 										title={title}
 										subtitle={subject.name}
 										coverUrl={getPreferredSubjectCoverUrl(subject)}
+										accentColor={
+											isWatching ? GROUP_COLOR[item.group] : undefined
+										}
 										label={label}
 										progress={`${c.ep_status}/${total || "?"} 集`}
 										meta={[
@@ -1214,6 +1287,30 @@ const styles = StyleSheet.create({
 	pageInfo: {
 		color: colors.muted,
 		fontSize: 13,
+		fontWeight: "600",
+	},
+	groupHeader: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: 8,
+		paddingVertical: 12,
+		paddingHorizontal: 2,
+		// 吸顶组头盖住滚动内容，需不透明背景
+		backgroundColor: colors.background,
+	},
+	groupHeaderBar: {
+		width: 4,
+		height: 16,
+		borderRadius: 2,
+	},
+	groupHeaderTitle: {
+		color: colors.text,
+		fontSize: 14,
+		fontWeight: "800",
+	},
+	groupHeaderCount: {
+		color: colors.muted,
+		fontSize: 12,
 		fontWeight: "600",
 	},
 });

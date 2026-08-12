@@ -91,8 +91,8 @@ android {
         applicationId 'com.bangumini.app'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 10003
-        versionName "1.0.3"
+        versionCode 10007
+        versionName "1.0.7"
         ndk {
             abiFilters 'arm64-v8a'
         }

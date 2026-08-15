@@ -82,8 +82,6 @@ export async function downloadApk(
 	return fileUri;
 }
 
-const FILE_PROVIDER_AUTHORITY = "com.bangumini.app.fileprovider";
-
 /**
  * 查询「安装未知应用」权限是否已授权（Android 8.0+ per-app 授权）。
  * 旧版本无此概念，视为已授权。
@@ -95,12 +93,23 @@ export async function canRequestPackageInstalls(): Promise<boolean> {
 	return (await BanguminiMedia.canRequestPackageInstalls()) === true;
 }
 
+/**
+ * 运行时实际的 applicationId（dev 构建带 .dev 后缀）。
+ * 授权引导和 FileProvider authority 都必须用它，不能硬编码正式包名。
+ */
+async function getPackageName(): Promise<string> {
+	const { BanguminiMedia } = NativeModules;
+	return (await BanguminiMedia.getPackageName()) as string;
+}
+
 export async function installApk(fileUri: string): Promise<void> {
 	if (Platform.OS !== "android") return;
 
+	const packageName = await getPackageName();
+
 	const contentUri = fileUri.replace(
 		FileSystem.cacheDirectory!,
-		`content://${FILE_PROVIDER_AUTHORITY}/apk/`,
+		`content://${packageName}.fileprovider/apk/`,
 	);
 
 	await IntentLauncher.startActivityAsync("android.intent.action.VIEW", {
@@ -113,10 +122,12 @@ export async function installApk(fileUri: string): Promise<void> {
 export async function openInstallPermissionSettings(): Promise<void> {
 	if (Platform.OS !== "android") return;
 
+	const packageName = await getPackageName();
+
 	await IntentLauncher.startActivityAsync(
 		"android.settings.MANAGE_UNKNOWN_APP_SOURCES",
 		{
-			data: "package:com.bangumini.app",
+			data: `package:${packageName}`,
 		},
 	);
 }

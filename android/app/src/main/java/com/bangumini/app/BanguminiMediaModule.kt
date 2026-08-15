@@ -34,6 +34,12 @@ class BanguminiMediaModule(
     }
 
     @ReactMethod
+    fun getPackageName(promise: Promise) {
+        // 返回运行时实际 applicationId（dev 构建带 .dev 后缀）
+        promise.resolve(reactApplicationContext.packageName)
+    }
+
+    @ReactMethod
     fun saveImageFromUrl(
         url: String,
         albumName: String,

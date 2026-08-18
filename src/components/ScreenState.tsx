@@ -1,4 +1,10 @@
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 
 import { colors } from "../theme/colors";
 
@@ -11,7 +17,13 @@ export function LoadingState({ label = "加载中" }: { label?: string }) {
   );
 }
 
-export function EmptyState({ title, detail }: { title: string; detail?: string }) {
+export function EmptyState({
+  title,
+  detail,
+}: {
+  title: string;
+  detail?: string;
+}) {
   return (
     <View style={styles.state}>
       <Text style={styles.emptyTitle}>{title}</Text>
@@ -20,7 +32,13 @@ export function EmptyState({ title, detail }: { title: string; detail?: string }
   );
 }
 
-export function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
+export function ErrorState({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry?: () => void;
+}) {
   return (
     <View style={styles.state}>
       <Text style={styles.emptyTitle}>加载失败</Text>
@@ -41,6 +59,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 10,
     padding: 24,
+    // 状态组件常作为整页渲染（如登录检查、加载详情），需自带主题背景避免白底
+    backgroundColor: colors.background,
   },
   stateText: {
     color: colors.muted,

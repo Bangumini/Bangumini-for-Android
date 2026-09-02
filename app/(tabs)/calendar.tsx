@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, RefreshControl, SectionList, StyleSheet, Text, View } from "react-native";
+import {
+  FlatList,
+  RefreshControl,
+  SectionList,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
@@ -14,7 +21,10 @@ import Animated, {
 
 import { getCalendar } from "../../shared/api/client";
 import type { CalendarItem, SubjectSmall } from "../../shared/api/types";
-import { getTodayBangumiWeekday, WEEKDAY_CN } from "../../shared/sort-collections";
+import {
+  getTodayBangumiWeekday,
+  WEEKDAY_CN,
+} from "../../shared/sort-collections";
 import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import {
   getPreferredSubjectCoverUrl,
@@ -25,7 +35,11 @@ import {
 } from "../../shared/storage/sqlite-cache";
 import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
-import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+} from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
@@ -36,7 +50,9 @@ const LAST_WEEKDAY = 7;
 const WEEKDAY_VALUES = [1, 2, 3, 4, 5, 6, 7];
 
 function getWeekdayLabel(value: number) {
-  return value === getTodayBangumiWeekday() ? "今天" : WEEKDAY_CN[value].replace("星期", "周");
+  return value === getTodayBangumiWeekday(Date.now())
+    ? "今天"
+    : WEEKDAY_CN[value].replace("星期", "周");
 }
 
 const WEEKDAY_OPTIONS = WEEKDAY_VALUES.map((value) => ({
@@ -48,8 +64,12 @@ type EnrichedItem = SubjectSmall & { weekday: number };
 
 async function loadCalendar(force = false) {
   if (!force) {
-    const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE);
-    const cacheHit = cached ?? await readCachedValue<CalendarItem[]>("calendar");
+    const cached = await readCachedValueWithin<CalendarItem[]>(
+      "calendar",
+      CACHE_MAX_AGE,
+    );
+    const cacheHit =
+      cached ?? (await readCachedValue<CalendarItem[]>("calendar"));
     if (cacheHit) return cacheHit;
   }
   const data = await getCalendar();
@@ -64,7 +84,9 @@ function matchesSearch(item: EnrichedItem, query: string) {
     item.name,
     item.name_cn,
     ...buildSubjectKeywords(item.name_cn, item.name),
-  ].join(" ").toLowerCase();
+  ]
+    .join(" ")
+    .toLowerCase();
   return haystack.includes(query);
 }
 
@@ -73,7 +95,9 @@ type CalendarSection = { title: string; weekday: number; data: SubjectSmall[] };
 export default function CalendarPage() {
   const alert = useAlert();
   const queryClient = useQueryClient();
-  const [weekday, setWeekday] = useState(getTodayBangumiWeekday());
+  const [weekday, setWeekday] = useState(() =>
+    getTodayBangumiWeekday(Date.now()),
+  );
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
@@ -98,7 +122,10 @@ export default function CalendarPage() {
     .onEnd((e) => {
       "worklet";
       const threshold = 40;
-      if (e.translationX > threshold && currentWeekdaySV.value > FIRST_WEEKDAY) {
+      if (
+        e.translationX > threshold &&
+        currentWeekdaySV.value > FIRST_WEEKDAY
+      ) {
         translateX.value = withTiming(0, { duration: 180 });
         fadeAnim.value = withSequence(
           withTiming(0, { duration: 80 }),
@@ -106,7 +133,10 @@ export default function CalendarPage() {
         );
         currentWeekdaySV.value -= 1;
         runOnJS(goToPrevWeekday)();
-      } else if (e.translationX < -threshold && currentWeekdaySV.value < LAST_WEEKDAY) {
+      } else if (
+        e.translationX < -threshold &&
+        currentWeekdaySV.value < LAST_WEEKDAY
+      ) {
         translateX.value = withTiming(0, { duration: 180 });
         fadeAnim.value = withSequence(
           withTiming(0, { duration: 80 }),
@@ -150,8 +180,10 @@ export default function CalendarPage() {
       })
       .catch(() => {});
 
-    return () => { cancelled = true; };
-  }, [calendarQuery.data]);
+    return () => {
+      cancelled = true;
+    };
+  }, [calendarQuery.data, queryClient]);
 
   const searchQuery = search.trim().toLowerCase();
   const isSearching = !!searchQuery;
@@ -198,7 +230,9 @@ export default function CalendarPage() {
 
   const dayItems = day?.items ?? [];
 
-  useEffect(() => { currentWeekdaySV.value = weekday; }, [weekday, currentWeekdaySV]);
+  useEffect(() => {
+    currentWeekdaySV.value = weekday;
+  }, [weekday, currentWeekdaySV]);
 
   async function refresh() {
     setRefreshing(true);
@@ -219,7 +253,9 @@ export default function CalendarPage() {
       coverUrl={getPreferredSubjectCoverUrl(item)}
       meta={[
         item.air_date || "日期未知",
-        item.rating?.score ? `评分 ${item.rating.score.toFixed(1)}` : "暂无评分",
+        item.rating?.score
+          ? `评分 ${item.rating.score.toFixed(1)}`
+          : "暂无评分",
         item.rank ? `#${item.rank}` : "无排名",
       ]}
       onPress={() => router.push(`/subject/${item.id}`)}
@@ -228,21 +264,35 @@ export default function CalendarPage() {
 
   return (
     <View style={styles.screen}>
-      <SegmentedControl options={WEEKDAY_OPTIONS} value={weekday} onChange={setWeekday} />
-      <SearchInput value={search} onChangeText={setSearch} placeholder="搜索本周放送" />
+      <SegmentedControl
+        options={WEEKDAY_OPTIONS}
+        value={weekday}
+        onChange={setWeekday}
+      />
+      <SearchInput
+        value={search}
+        onChangeText={setSearch}
+        placeholder="搜索本周放送"
+      />
 
       {calendarQuery.isLoading ? (
         <LoadingState label="加载日历" />
       ) : calendarQuery.isError && !calendarQuery.data ? (
         <ErrorState
-          message={calendarQuery.error instanceof Error ? calendarQuery.error.message : "无法加载日历"}
+          message={
+            calendarQuery.error instanceof Error
+              ? calendarQuery.error.message
+              : "无法加载日历"
+          }
           onRetry={() => void calendarQuery.refetch()}
         />
       ) : isSearching ? (
         <SectionList
           sections={searchSections}
           keyExtractor={(item) => String(item.id)}
-          contentContainerStyle={searchSections.length ? styles.list : styles.emptyList}
+          contentContainerStyle={
+            searchSections.length ? styles.list : styles.emptyList
+          }
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -257,7 +307,9 @@ export default function CalendarPage() {
             </View>
           )}
           ItemSeparatorComponent={() => <View style={styles.separator} />}
-          ListEmptyComponent={<EmptyState title="没有匹配条目" detail="调整搜索词或切换星期" />}
+          ListEmptyComponent={
+            <EmptyState title="没有匹配条目" detail="调整搜索词或切换星期" />
+          }
           renderItem={renderItem}
           stickySectionHeadersEnabled={false}
         />
@@ -267,7 +319,9 @@ export default function CalendarPage() {
             <FlatList
               data={dayItems}
               keyExtractor={(item) => String(item.id)}
-              contentContainerStyle={dayItems.length ? styles.list : styles.emptyList}
+              contentContainerStyle={
+                dayItems.length ? styles.list : styles.emptyList
+              }
               refreshControl={
                 <RefreshControl
                   refreshing={refreshing}

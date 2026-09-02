@@ -14,10 +14,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import Constants from "expo-constants";
 
 import { cleanupExpiredCache } from "../../shared/storage/sqlite-cache";
-import {
-	setCopySubjectTitleWithSeason,
-	shouldCopySubjectTitleWithSeason,
-} from "../../src/api/subject-title-copy";
+	import {
+		setCopySubjectTitleWithSeason,
+		shouldCopySubjectTitleWithSeason,
+	} from "../../src/api/subject-title-copy";
+	import {
+		isCrossSeasonCountEnabled,
+		setCrossSeasonCountEnabled,
+	} from "../../src/api/cross-season-count";
 import {
 	checkForUpdate,
 	downloadApk,
@@ -57,6 +61,7 @@ export default function SettingsPage() {
 		useAuth();
 	const [token, setToken] = useState("");
 	const [copyWithSeason, setCopyWithSeason] = useState(true);
+	const [crossSeasonCount, setCrossSeasonCount] = useState(false);
 	const [savingToken, setSavingToken] = useState(false);
 
 	const [updateStatus, setUpdateStatus] = useState<
@@ -77,6 +82,7 @@ export default function SettingsPage() {
 
 	useEffect(() => {
 		void shouldCopySubjectTitleWithSeason().then(setCopyWithSeason);
+		void isCrossSeasonCountEnabled().then(setCrossSeasonCount);
 	}, []);
 
 	async function updateToken() {
@@ -99,6 +105,11 @@ export default function SettingsPage() {
 	async function toggleCopyWithSeason(value: boolean) {
 		setCopyWithSeason(value);
 		await setCopySubjectTitleWithSeason(value);
+	}
+
+	async function toggleCrossSeasonCount(value: boolean) {
+		setCrossSeasonCount(value);
+		await setCrossSeasonCountEnabled(value);
 	}
 
 	async function clearExpiredCache() {
@@ -242,6 +253,17 @@ export default function SettingsPage() {
 						value={copyWithSeason}
 						onValueChange={(value) => void toggleCopyWithSeason(value)}
 						thumbColor={copyWithSeason ? colors.primary : colors.muted}
+						trackColor={{ false: colors.chip, true: colors.primaryMuted }}
+					/>
+				</SettingsRow>
+				<SettingsRow
+					title="跨季连续计数"
+					detail="开启后条目详情页按整个系列连续显示集数，例如第二季第 1 集显示为第 13 集"
+				>
+					<Switch
+						value={crossSeasonCount}
+						onValueChange={(value) => void toggleCrossSeasonCount(value)}
+						thumbColor={crossSeasonCount ? colors.primary : colors.muted}
 						trackColor={{ false: colors.chip, true: colors.primaryMuted }}
 					/>
 				</SettingsRow>

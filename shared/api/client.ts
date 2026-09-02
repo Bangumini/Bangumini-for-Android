@@ -1,4 +1,15 @@
-import type { CalendarItem, Episode, PagedResponse, RelatedCharacter, RelatedPerson, SearchResponse, Subject, SubjectRelation, User, UserCollection } from "./types";
+import type {
+  CalendarItem,
+  Episode,
+  PagedResponse,
+  RelatedCharacter,
+  RelatedPerson,
+  SearchResponse,
+  Subject,
+  SubjectRelation,
+  User,
+  UserCollection,
+} from "./types";
 
 const BASE_URL = "https://api.bgm.tv";
 
@@ -30,7 +41,11 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
   return headers;
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, retries = 3): Promise<Response> {
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  retries = 3,
+): Promise<Response> {
   for (let i = 0; i < retries; i++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -47,7 +62,11 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 3): Prom
   throw new Error("unreachable");
 }
 
-async function request<T>(path: string, options: RequestInit = {}, maxRetries = 3): Promise<T> {
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+  maxRetries = 3,
+): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const authHeaders = await getAuthHeaders();
   const headers = { ...authHeaders, ...(options.headers || {}) };
@@ -59,13 +78,17 @@ async function request<T>(path: string, options: RequestInit = {}, maxRetries = 
     if (res.ok) {
       const text = await res.text();
       if (!text) return undefined as T;
-      return JSON.parse(text) as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new Error(`Bangumi API returned invalid JSON for ${path}`);
+      }
     }
 
     const body = await res.text();
     lastError = new Error(`Bangumi API error ${res.status}: ${body}`);
 
-    if (res.status >= 500 && res.status < 600 || res.status === 429) {
+    if ((res.status >= 500 && res.status < 600) || res.status === 429) {
       if (attempt < maxRetries - 1) {
         const delay = parseRetryDelay(res, body);
         await new Promise((r) => setTimeout(r, delay));
@@ -75,7 +98,8 @@ async function request<T>(path: string, options: RequestInit = {}, maxRetries = 
     throw lastError;
   }
 
-  throw lastError!;
+  if (lastError) throw lastError;
+  throw new Error(`Bangumi API request failed: ${path}`);
 }
 
 function parseRetryDelay(res: Response, body: string): number {
@@ -89,17 +113,23 @@ function parseRetryDelay(res: Response, body: string): number {
     if (cf?.retry_after && typeof cf.retry_after === "number") {
       return cf.retry_after * 1000;
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 
   return 1000 * Math.pow(2, Math.floor(Math.random() * 3));
 }
 
 /** Search Bangumi for an anime subject by name, returns first match */
-export async function searchAnimeSubject(keyword: string): Promise<{ id: number; name_cn: string } | null> {
+export async function searchAnimeSubject(
+  keyword: string,
+): Promise<{ id: number; name_cn: string } | null> {
   try {
     const resp = await searchSubjects({ keyword, type: [2], limit: 3 });
     const match = resp.data?.[0];
-    return match ? { id: match.id, name_cn: match.name_cn || match.name } : null;
+    return match
+      ? { id: match.id, name_cn: match.name_cn || match.name }
+      : null;
   } catch {
     return null;
   }
@@ -131,11 +161,14 @@ export async function searchSubjects(params: {
     body.filter = { type: params.type };
   }
 
-  return request<SearchResponse>(`/v0/search/subjects?${searchParams.toString()}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return request<SearchResponse>(
+    `/v0/search/subjects?${searchParams.toString()}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 /** GET /v0/subjects/{id} — 获取条目详情 */
@@ -159,13 +192,16 @@ export async function getUserCollections(params: {
   const uname = params.username;
 
   const searchParams = new URLSearchParams();
-  if (params.subjectType) searchParams.set("subject_type", String(params.subjectType));
+  if (params.subjectType)
+    searchParams.set("subject_type", String(params.subjectType));
   if (params.type) searchParams.set("type", String(params.type));
   if (params.limit) searchParams.set("limit", String(params.limit));
   if (params.offset) searchParams.set("offset", String(params.offset));
 
   const qs = searchParams.toString();
-  return request<PagedResponse<UserCollection>>(`/v0/users/${uname}/collections${qs ? `?${qs}` : ""}`);
+  return request<PagedResponse<UserCollection>>(
+    `/v0/users/${uname}/collections${qs ? `?${qs}` : ""}`,
+  );
 }
 
 /** POST /v0/users/-/collections/{subject_id} — 新增或修改收藏 */
@@ -187,28 +223,63 @@ export async function postUserCollection(
 }
 
 /** GET /v0/users/{username}/collections/{subject_id} — 获取单个条目收藏状态 */
-export async function getUserCollection(username: string, subjectId: number): Promise<UserCollection> {
-  return request<UserCollection>(`/v0/users/${username}/collections/${subjectId}`);
+export async function getUserCollection(
+  username: string,
+  subjectId: number,
+): Promise<UserCollection> {
+  return request<UserCollection>(
+    `/v0/users/${username}/collections/${subjectId}`,
+  );
 }
 
 /** GET /v0/subjects/{id}/persons — 获取条目关联人物 */
-export async function getSubjectPersons(subjectId: number): Promise<RelatedPerson[]> {
+export async function getSubjectPersons(
+  subjectId: number,
+): Promise<RelatedPerson[]> {
   return request<RelatedPerson[]>(`/v0/subjects/${subjectId}/persons`);
 }
 
 /** GET /v0/subjects/{id}/characters — 获取条目关联角色 */
-export async function getSubjectCharacters(subjectId: number): Promise<RelatedCharacter[]> {
+export async function getSubjectCharacters(
+  subjectId: number,
+): Promise<RelatedCharacter[]> {
   return request<RelatedCharacter[]>(`/v0/subjects/${subjectId}/characters`);
 }
 
 /** GET /v0/subjects/{id}/subjects — 获取条目关联条目 (OP/ED/OST等) */
-export async function getSubjectRelations(subjectId: number): Promise<SubjectRelation[]> {
+export async function getSubjectRelations(
+  subjectId: number,
+): Promise<SubjectRelation[]> {
   return request<SubjectRelation[]>(`/v0/subjects/${subjectId}/subjects`);
 }
 
-/** GET /v0/episodes — 获取条目剧集列表 */
-export async function getEpisodes(subjectId: number): Promise<PagedResponse<Episode>> {
-  return request<PagedResponse<Episode>>(`/v0/episodes?subject_id=${subjectId}&limit=100`);
+/** GET /v0/episodes — 获取单页条目剧集列表 */
+export async function getEpisodes(
+  subjectId: number,
+  offset = 0,
+): Promise<PagedResponse<Episode>> {
+  return request<PagedResponse<Episode>>(
+    `/v0/episodes?subject_id=${subjectId}&limit=100&offset=${offset}`,
+  );
+}
+
+/** 获取条目的完整剧集列表（Bangumi 单页最多 100 条）。 */
+export async function getAllEpisodes(
+  subjectId: number,
+): Promise<PagedResponse<Episode>> {
+  const episodes: Episode[] = [];
+  let total = 0;
+  let offset = 0;
+
+  do {
+    const page = await getEpisodes(subjectId, offset);
+    total = page.total;
+    episodes.push(...page.data);
+    if (page.data.length === 0) break;
+    offset += page.data.length;
+  } while (episodes.length < total);
+
+  return { data: episodes, total, limit: 100, offset: 0 };
 }
 
 /** GET /v0/users/{username}/collections — 全量获取用户收藏（处理分页） */
@@ -216,7 +287,12 @@ export async function getAllUserCollections(params: {
   username: string;
   type?: number;
 }): Promise<PagedResponse<UserCollection>> {
-  const result: PagedResponse<UserCollection> = { data: [], total: 0, limit: 100, offset: 0 };
+  const result: PagedResponse<UserCollection> = {
+    data: [],
+    total: 0,
+    limit: 100,
+    offset: 0,
+  };
 
   while (true) {
     const page = await getUserCollections({

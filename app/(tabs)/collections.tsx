@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+	AppState,
 	SectionList,
 	Pressable,
 	RefreshControl,
@@ -18,27 +19,44 @@ import Animated, {
 	withTiming,
 } from "react-native-reanimated";
 import * as Clipboard from "expo-clipboard";
-import { router } from "expo-router";
+import { router, useFocusEffect } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ionicons } from "@expo/vector-icons";
 
 import {
+	getAllEpisodes,
 	getAllUserCollections,
 	getCalendar,
-	getEpisodes,
+	getSubject,
 } from "../../shared/api/client";
 import { getAiringAt } from "../../shared/api/anilist";
 import type {
 	CalendarItem,
 	CollectionType,
+	Episode,
 	PagedResponse,
 	UserCollection,
 } from "../../shared/api/types";
 import { CollectionTypeLabel, SubjectTypeLabel } from "../../shared/api/types";
 import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import {
+	applyAiringLookupResult,
+	isAiringCacheRecord,
+	isAiringRecordUsable,
+	shouldRefreshAiringRecord,
+	toAiringObservation,
+	type AiringCacheRecord,
+} from "../../shared/airing-cache";
+import {
+	deriveAiredEpisodeCount,
+	deriveAiringSchedule,
+	getNextEpisodeAiringAt,
+	getNextScheduleBoundary,
+	type AiringObservation,
+	type AiringSchedule,
+} from "../../shared/airing-schedule";
+import {
 	getDisplayLabel,
-	getTodayBangumiWeekday,
 	GROUP_COLOR,
 	GROUP_LABEL,
 	sortCollections,
@@ -48,13 +66,13 @@ import type {
 	SortedGroup,
 } from "../../shared/sort-collections";
 import {
+	deleteCachedValuesByPrefix,
 	getPreferredSubjectCoverUrl,
 	readCachedCollection,
 	readCachedSubject,
 	readCachedValue,
 	readCachedValueWithin,
 	readCachedValues,
-	readCachedValuesWithin,
 	writeCachedCollection,
 	writeCachedSubject,
 	writeCachedSubjectPreviews,
@@ -84,19 +102,23 @@ import { colors } from "../../src/theme/colors";
 import { useAlert } from "../../src/components/Dialog";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
-const AIRING_CACHE_PREFIX = "anilist-airing-";
-const EPISODES_CACHE_PREFIX = "episodes-";
-const AIRING_TIME_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 90;
+const AIRING_CACHE_PREFIX = "anilist-airing-v2-";
+const LEGACY_AIRING_CACHE_PREFIX = "anilist-airing-";
+const EPISODES_CACHE_PREFIX = "episodes-schedule-v2-";
+const LEGACY_EPISODES_CACHE_PREFIX = "episodes-";
+const AIRING_REQUEST_DELAY = 700;
+const EPISODES_CACHE_MAX_AGE = 1000 * 60 * 30;
+const CLOCK_EPSILON_MS = 1000;
 const PAGE_SIZE = 20;
 
 const EMPTY_AIRING_MAP = new Map<number, number>();
-const EMPTY_AIRING_TIME_MAP = new Map<
-	number,
-	{ airingAt: number; episode: number }
->();
-const EMPTY_EPISODE_MAP = new Map<number, number>();
+const EMPTY_AIRING_RECORD_MAP = new Map<number, AiringCacheRecord>();
+const EMPTY_EPISODE_LIST_MAP = new Map<number, Episode[]>();
 
-type AiringTime = { airingAt: number; episode: number };
+type EpisodeScheduleCache = {
+	episodes: Episode[];
+	checkedAt: number;
+};
 
 /** 分组 section（仅在看 tab 使用；跨页延续的组在后续页仍渲染组头） */
 interface CollectionSection {
@@ -107,7 +129,7 @@ interface CollectionSection {
 	data: SortedCollection[];
 }
 
-const COLLECTION_OPTIONS: Array<{ value: CollectionType; label: string }> = [
+const COLLECTION_OPTIONS: { value: CollectionType; label: string }[] = [
 	{ value: 3, label: "在看" },
 	{ value: 1, label: "想看" },
 	{ value: 2, label: "看过" },
@@ -115,24 +137,91 @@ const COLLECTION_OPTIONS: Array<{ value: CollectionType; label: string }> = [
 	{ value: 5, label: "抛弃" },
 ];
 
-const todayDateKey = (() => {
-	const d = new Date();
-	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-})();
-
-async function readCachedAiringTimes(subjectIds: number[]) {
-	const keys = subjectIds.map((id) => `${AIRING_CACHE_PREFIX}${id}`);
-	const [cachedByKey, staleByKey] = await Promise.all([
-		readCachedValuesWithin<AiringTime>(keys, AIRING_TIME_CACHE_MAX_AGE),
-		readCachedValues<AiringTime>(keys),
-	]);
-	const map = new Map<number, AiringTime>();
-	for (const id of subjectIds) {
-		const key = `${AIRING_CACHE_PREFIX}${id}`;
-		const v = cachedByKey.get(key) ?? staleByKey.get(key);
-		if (v) map.set(id, v);
+async function readCachedAiringRecords(subjectIds: number[]) {
+	const uniqueIds = [...new Set(subjectIds)];
+	const keys = uniqueIds.map((id) => `${AIRING_CACHE_PREFIX}${id}`);
+	const cachedByKey = await readCachedValues<unknown>(keys);
+	const nowMs = Date.now();
+	const map = new Map<number, AiringCacheRecord>();
+	for (const id of uniqueIds) {
+		const value = cachedByKey.get(`${AIRING_CACHE_PREFIX}${id}`);
+		if (isAiringCacheRecord(value) && isAiringRecordUsable(value, nowMs)) {
+			map.set(id, value);
+		}
 	}
 	return map;
+}
+
+function getInfoboxAliases(subject: Awaited<ReturnType<typeof getSubject>>) {
+	const aliases: string[] = [];
+	for (const item of subject.infobox ?? []) {
+		if (!/(别名|中文名|英文名|日文名|原作名)/.test(item.key)) continue;
+		if (typeof item.value === "string") aliases.push(item.value);
+		else for (const value of item.value) aliases.push(value.v);
+	}
+	return aliases;
+}
+
+async function delay(ms: number) {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function lookupAiringTime(target: {
+	subjectId: number;
+	name: string;
+	nameCn: string;
+}) {
+	let result = await getAiringAt(target.name);
+	if (result.status !== "not_found") return result;
+
+	let aliases = target.nameCn ? [target.nameCn] : [];
+	try {
+		aliases = [
+			...aliases,
+			...getInfoboxAliases(await getSubject(target.subjectId)),
+		];
+	} catch (error) {
+		console.warn("[airing-schedule] failed to load BGM aliases", error);
+	}
+	for (const title of [...new Set(aliases)].filter(Boolean)) {
+		if (title === target.name) continue;
+		await delay(AIRING_REQUEST_DELAY);
+		result = await getAiringAt(title);
+		if (result.status !== "not_found") return result;
+	}
+	return result;
+}
+
+function getEpisodeCacheKey(subjectId: number) {
+	return `${EPISODES_CACHE_PREFIX}${subjectId}`;
+}
+
+function isEpisodeScheduleCache(value: unknown): value is EpisodeScheduleCache {
+	if (!value || typeof value !== "object") return false;
+	const cache = value as Partial<EpisodeScheduleCache>;
+	return Array.isArray(cache.episodes) && typeof cache.checkedAt === "number";
+}
+
+function deriveAiringMaps(
+	episodeListMap: ReadonlyMap<number, Episode[]>,
+	observationMap: ReadonlyMap<number, AiringObservation>,
+	airingMap: ReadonlyMap<number, number>,
+	nowMs: number,
+) {
+	const scheduleMap = new Map<number, AiringSchedule>();
+	const airedEpMap = new Map<number, number>();
+	const nextAiringAtMap = new Map<number, number>();
+	for (const [subjectId, episodes] of episodeListMap) {
+		const observation = observationMap.get(subjectId);
+		const schedule = observation
+			? deriveAiringSchedule(airingMap.get(subjectId), episodes, observation)
+			: null;
+		if (schedule) scheduleMap.set(subjectId, schedule);
+		airedEpMap.set(subjectId, deriveAiredEpisodeCount(episodes, schedule, nowMs));
+		const nextAiringAt = getNextEpisodeAiringAt(episodes, schedule, nowMs);
+		if (nextAiringAt !== null) nextAiringAtMap.set(subjectId, nextAiringAt);
+	}
+	return { scheduleMap, airedEpMap, nextAiringAtMap };
 }
 
 async function loadCollections(
@@ -147,8 +236,7 @@ async function loadCollections(
 			CACHE_MAX_AGE,
 		);
 		const cacheHit =
-			cached ??
-			(await readCachedValue<PagedResponse<UserCollection>>(cacheKey));
+			cached ?? (await readCachedValue<PagedResponse<UserCollection>>(cacheKey));
 		if (cacheHit) {
 			await mergeSubjectCollections(cacheHit, username);
 			cacheHit.data = cacheHit.data.filter((c) => c.type === type);
@@ -249,6 +337,31 @@ export default function CollectionsPage() {
 	const [page, setPage] = useState(1);
 	const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
 	const [taskPanelExpanded, setTaskPanelExpanded] = useState(false);
+	const [nowMs, setNowMs] = useState(() => Date.now());
+	const [isPageFocused, setIsPageFocused] = useState(false);
+	const airingRefreshGenerationRef = useRef(0);
+	const syncClock = useCallback(() => setNowMs(Date.now()), []);
+
+	useEffect(() => {
+		const subscription = AppState.addEventListener("change", (state) => {
+			if (state === "active") syncClock();
+		});
+		return () => subscription.remove();
+	}, [syncClock]);
+
+	useFocusEffect(
+		useCallback(() => {
+			setIsPageFocused(true);
+			syncClock();
+			void queryClient.invalidateQueries({
+				queryKey: ["episodes-schedule-v2"],
+			});
+			void queryClient.invalidateQueries({
+				queryKey: ["anilist-airing-times-v2"],
+			});
+			return () => setIsPageFocused(false);
+		}, [queryClient, syncClock]),
+	);
 
 	// --- Pagination: animated swipe between pages ---
 	const translateX = useSharedValue(0);
@@ -344,10 +457,12 @@ export default function CollectionsPage() {
 		() => getAiringMap(calendarQuery.data),
 		[calendarQuery.data],
 	);
-	const today = getTodayBangumiWeekday();
 	const searchQuery = search.trim().toLowerCase();
 
-	const sourceCollections = collectionsQuery.data?.data ?? [];
+	const sourceCollections = useMemo(
+		() => collectionsQuery.data?.data ?? [],
+		[collectionsQuery.data?.data],
+	);
 	const visibleCollectionTasks = useMemo(() => {
 		const tasks = username
 			? collectionTasks.filter((task) => task.payload.username === username)
@@ -373,6 +488,16 @@ export default function CollectionsPage() {
 		[sourceCollections, visibleCollectionTasks, collectionType],
 	);
 	const isWatching = collectionType === 3;
+	const scheduleWeekdayMap = useMemo(() => {
+		const map = new Map(airingMap);
+		for (const item of rawCollections) {
+			const weekday = item.subject.air_weekday;
+			if (!map.has(item.subject_id) && weekday && weekday > 0) {
+				map.set(item.subject_id, weekday);
+			}
+		}
+		return map;
+	}, [airingMap, rawCollections]);
 
 	// --- Phase 1: Backfill total_episodes from SQLite cache ---
 	const { data: totalEpBackfill } = useQuery({
@@ -410,8 +535,7 @@ export default function CollectionsPage() {
 	const { data: episodeTotals } = useQuery({
 		queryKey: ["episode-totals", subjectsNeedingEpisodes.join(",")],
 		queryFn: async () => {
-			if (subjectsNeedingEpisodes.length === 0)
-				return new Map<number, number>();
+			if (subjectsNeedingEpisodes.length === 0) return new Map<number, number>();
 			const totals = new Map<number, number>();
 
 			// Batch fetch (10 at a time to avoid rate limiting)
@@ -419,7 +543,7 @@ export default function CollectionsPage() {
 				const batch = subjectsNeedingEpisodes.slice(i, i + 10);
 				const results = await Promise.allSettled(
 					batch.map((id) =>
-						getEpisodes(id).then((data) => {
+						getAllEpisodes(id).then((data) => {
 							const mainEps = data.data.filter((ep) => ep.type === 0);
 							return { id, totalEp: mainEps.length };
 						}),
@@ -465,11 +589,8 @@ export default function CollectionsPage() {
 				? rawCollections
 						.filter((item) => !airingMap.has(item.subject_id))
 						.filter((item) => {
-							const total =
-								item.subject.eps || item.subject.total_episodes || 0;
-							return (
-								item.ep_status > 0 && (total === 0 || item.ep_status < total)
-							);
+							const total = item.subject.eps || item.subject.total_episodes || 0;
+							return total === 0 || item.ep_status < total;
 						})
 						.map((item) => item.subject_id)
 				: [],
@@ -477,11 +598,14 @@ export default function CollectionsPage() {
 	);
 
 	const allEpisodeIds = useMemo(
-		() => [...new Set([...airingIds, ...staleAiringIds])],
-		[airingIds, staleAiringIds],
+		() =>
+			isWatching
+				? [...new Set(rawCollections.map((item) => item.subject_id))]
+				: [],
+		[isWatching, rawCollections],
 	);
 
-	// --- Phase 3: Cached AniList airing times (fast path for offline/first paint) ---
+	// --- Phase 3: AniList 排期 cache v2 与可刷新网络查询 ---
 	const airingTimeCacheIds = useMemo(
 		() =>
 			isWatching
@@ -490,11 +614,10 @@ export default function CollectionsPage() {
 		[rawCollections, isWatching],
 	);
 	const airingTimeCacheKey = airingTimeCacheIds.join(",");
-
-	const { data: cachedAiringTimeMap, isFetched: cachedAiringTimeFetched } =
+	const { data: cachedAiringRecordMap, isFetched: cachedAiringTimeFetched } =
 		useQuery({
-			queryKey: ["anilist-airing-times-cache", airingTimeCacheKey],
-			queryFn: () => readCachedAiringTimes(airingTimeCacheIds),
+			queryKey: ["anilist-airing-times-cache-v2", airingTimeCacheKey],
+			queryFn: () => readCachedAiringRecords(airingTimeCacheIds),
 			enabled: airingTimeCacheIds.length > 0,
 			staleTime: 5 * 60 * 1000,
 			gcTime: CACHE_MAX_AGE * 2,
@@ -514,47 +637,45 @@ export default function CollectionsPage() {
 			.map((item) => ({
 				subjectId: item.subject_id,
 				name: item.subject.name,
+				nameCn: item.subject.name_cn,
 			}));
 	}, [rawCollections, airingIds, staleAiringIds, airingMap, isWatching]);
 
 	const airingTimeTargetKey = airingTimeTargets
-		.map((t) => t.subjectId)
+		.map((target) => target.subjectId)
 		.join(",");
 
-	const { data: airingTimeMapData } = useQuery({
-		queryKey: ["anilist-airing-times", airingTimeTargetKey],
+	const { data: airingRecordMapData } = useQuery({
+		queryKey: ["anilist-airing-times-v2", airingTimeTargetKey],
 		queryFn: async () => {
-			const map = new Map<number, AiringTime>(cachedAiringTimeMap);
-
-			const missing = airingTimeTargets.filter((t) => !map.has(t.subjectId));
-			const AIRING_BATCH_SIZE = 3;
-			for (let i = 0; i < missing.length; i += AIRING_BATCH_SIZE) {
-				const batch = missing
-					.slice(i, i + AIRING_BATCH_SIZE)
-					.filter((t) => t.name);
-				if (batch.length === 0) continue;
-
-				const results = await Promise.allSettled(
-					batch.map(async (target) => {
-						const result = await getAiringAt(target.name);
-						return { target, result };
-					}),
+			const generation = airingRefreshGenerationRef.current;
+			const persistedRecords = await readCachedAiringRecords(airingTimeCacheIds);
+			const map = new Map<number, AiringCacheRecord>(persistedRecords);
+			for (const [subjectId, record] of cachedAiringRecordMap ??
+				EMPTY_AIRING_RECORD_MAP) {
+				if (!map.has(subjectId) && isAiringRecordUsable(record, Date.now())) {
+					map.set(subjectId, record);
+				}
+			}
+			const targetsToRefresh = airingTimeTargets.filter((target) =>
+				shouldRefreshAiringRecord(map.get(target.subjectId), Date.now()),
+			);
+			for (const [index, target] of targetsToRefresh.entries()) {
+				if (generation !== airingRefreshGenerationRef.current) return map;
+				if (index > 0) await delay(AIRING_REQUEST_DELAY);
+				const result = await lookupAiringTime(target);
+				if (generation !== airingRefreshGenerationRef.current) return map;
+				if (result.status === "network_error") {
+					console.warn(`[airing-schedule] ${target.subjectId}: ${result.message}`);
+				}
+				const record = applyAiringLookupResult(
+					map.get(target.subjectId),
+					result,
+					Date.now(),
 				);
-
-				for (const r of results) {
-					if (r.status === "fulfilled" && r.value.result) {
-						const { target, result } = r.value;
-						await writeCachedValue(
-							`${AIRING_CACHE_PREFIX}${target.subjectId}`,
-							result,
-						);
-						map.set(target.subjectId, result);
-					}
-				}
-
-				if (i + AIRING_BATCH_SIZE < missing.length) {
-					await new Promise((r) => setTimeout(r, 500));
-				}
+				if (!record) continue;
+				await writeCachedValue(`${AIRING_CACHE_PREFIX}${target.subjectId}`, record);
+				map.set(target.subjectId, record);
 			}
 			return map;
 		},
@@ -563,75 +684,123 @@ export default function CollectionsPage() {
 		gcTime: CACHE_MAX_AGE * 2,
 	});
 
-	const airingTimeMap = useMemo(() => {
-		if (!cachedAiringTimeMap && !airingTimeMapData)
-			return EMPTY_AIRING_TIME_MAP;
-		const merged = new Map<number, AiringTime>(cachedAiringTimeMap);
-		if (airingTimeMapData) {
-			for (const [subjectId, airingTime] of airingTimeMapData) {
-				merged.set(subjectId, airingTime);
+	const airingRecordMap = useMemo(() => {
+		if (!cachedAiringRecordMap && !airingRecordMapData) {
+			return EMPTY_AIRING_RECORD_MAP;
+		}
+		const merged = new Map<number, AiringCacheRecord>(
+			cachedAiringRecordMap ?? undefined,
+		);
+		if (airingRecordMapData) {
+			for (const [subjectId, record] of airingRecordMapData) {
+				merged.set(subjectId, record);
 			}
 		}
 		return merged;
-	}, [cachedAiringTimeMap, airingTimeMapData]);
+	}, [cachedAiringRecordMap, airingRecordMapData]);
+	const airingObservationMap = useMemo(() => {
+		const map = new Map<number, AiringObservation>();
+		for (const [subjectId, record] of airingRecordMap) {
+			const observation = toAiringObservation(record);
+			if (observation) map.set(subjectId, observation);
+		}
+		return map;
+	}, [airingRecordMap]);
 
-	const { data: airedEpMap } = useQuery({
-		queryKey: ["aired-episodes", todayDateKey, allEpisodeIds.join(",")],
+	// --- Phase 4: 缓存完整 BGM 主线剧集，再从本地时钟推导已播集数 ---
+	const { data: episodeListMapData } = useQuery({
+		queryKey: ["episodes-schedule-v2", allEpisodeIds.join(",")],
 		queryFn: async () => {
-			if (allEpisodeIds.length === 0) return EMPTY_EPISODE_MAP;
-			const map = new Map<number, number>();
+			const generation = airingRefreshGenerationRef.current;
+			const map = new Map<number, Episode[]>();
+			const cachedRecords = new Map<number, EpisodeScheduleCache>();
 			const idsToFetch: number[] = [];
-
-			// Batch-read all cached episode counts instead of sequential per-ID queries
-			const cacheKeys = allEpisodeIds.map(
-				(id) => `${EPISODES_CACHE_PREFIX}${id}`,
+			const cachedByKey = await readCachedValues<unknown>(
+				allEpisodeIds.map(getEpisodeCacheKey),
 			);
-			const cachedByKey = await readCachedValues<{
-				airedEp: number;
-				checkedAt: number;
-			}>(cacheKeys);
-
+			const checkedAt = Date.now();
 			for (const id of allEpisodeIds) {
-				const cacheKey = `${EPISODES_CACHE_PREFIX}${id}`;
-				const cached = cachedByKey.get(cacheKey);
-				if (cached && Date.now() - cached.checkedAt <= CACHE_MAX_AGE) {
-					map.set(id, cached.airedEp);
-					continue;
+				const cached = cachedByKey.get(getEpisodeCacheKey(id));
+				if (isEpisodeScheduleCache(cached)) {
+					cachedRecords.set(id, cached);
+					if (checkedAt - cached.checkedAt <= EPISODES_CACHE_MAX_AGE) {
+						map.set(id, cached.episodes);
+						continue;
+					}
 				}
 				idsToFetch.push(id);
 			}
 
-			if (idsToFetch.length > 0) {
-				const results = await Promise.allSettled(
-					idsToFetch.map((id) =>
-						getEpisodes(id).then((data) => {
-							const mainEps = data.data.filter((ep) => ep.type === 0);
-							const airedEp = mainEps.filter(
-								(ep) => ep.airdate && ep.airdate <= todayDateKey,
-							).length;
-							return { id, airedEp };
-						}),
+			const results = await Promise.allSettled(
+				idsToFetch.map(async (id) => ({
+					id,
+					episodes: (await getAllEpisodes(id)).data.filter(
+						(episode) => episode.type === 0,
 					),
-				);
-				for (const result of results) {
-					if (result.status === "fulfilled") {
-						const { id, airedEp } = result.value;
-						map.set(id, airedEp);
-						await writeCachedValue(`${EPISODES_CACHE_PREFIX}${id}`, {
-							airedEp,
-							checkedAt: Date.now(),
-						});
-					}
+				})),
+			);
+			for (let index = 0; index < results.length; index += 1) {
+				if (generation !== airingRefreshGenerationRef.current) return map;
+				const result = results[index];
+				const id = idsToFetch[index];
+				if (result.status === "fulfilled") {
+					const record: EpisodeScheduleCache = {
+						episodes: result.value.episodes,
+						checkedAt: Date.now(),
+					};
+					await writeCachedValue(getEpisodeCacheKey(id), record);
+					map.set(id, record.episodes);
+				} else {
+					console.warn(
+						`[airing-schedule] failed to load BGM episodes for ${id}`,
+						result.reason,
+					);
+					const stale = cachedRecords.get(id);
+					if (stale) map.set(id, stale.episodes);
 				}
 			}
 			return map;
 		},
 		enabled: isWatching && allEpisodeIds.length > 0,
-		staleTime: CACHE_MAX_AGE,
+		staleTime: EPISODES_CACHE_MAX_AGE,
 		gcTime: CACHE_MAX_AGE * 2,
 	});
 
-	const episodeMap = airedEpMap ?? EMPTY_EPISODE_MAP;
+	const episodeListMap = episodeListMapData ?? EMPTY_EPISODE_LIST_MAP;
+	const derivedAiringData = useMemo(
+		() =>
+			deriveAiringMaps(
+				episodeListMap,
+				airingObservationMap,
+				scheduleWeekdayMap,
+				nowMs,
+			),
+		[episodeListMap, airingObservationMap, scheduleWeekdayMap, nowMs],
+	);
+	const episodeMap = derivedAiringData.airedEpMap;
+	const nextAiringAtMap = derivedAiringData.nextAiringAtMap;
+
+	useEffect(() => {
+		if (!isWatching || !isPageFocused) return;
+		const nextBoundary = getNextScheduleBoundary(nextAiringAtMap.values(), nowMs);
+		const timer = setTimeout(
+			() => {
+				syncClock();
+				void queryClient.invalidateQueries({
+					queryKey: ["anilist-airing-times-v2"],
+				});
+			},
+			Math.max(1000, nextBoundary - Date.now() + CLOCK_EPSILON_MS),
+		);
+		return () => clearTimeout(timer);
+	}, [
+		isWatching,
+		isPageFocused,
+		nextAiringAtMap,
+		nowMs,
+		queryClient,
+		syncClock,
+	]);
 
 	// --- Background refresh: always fetch network data after showing cache ---
 	const lastRefreshedKeyRef = useRef<string | null>(null);
@@ -658,9 +827,7 @@ export default function CollectionsPage() {
 					networkCollections.data.map((c) => c.subject),
 				);
 				Promise.allSettled(
-					networkCollections.data.map((c) =>
-						writeCachedCollection(username!, c),
-					),
+					networkCollections.data.map((c) => writeCachedCollection(username!, c)),
 				).catch(() => {});
 
 				await writeCachedValue("calendar", networkCalendar);
@@ -677,15 +844,12 @@ export default function CollectionsPage() {
 
 				const filtered = {
 					...networkCollections,
-					data: networkCollections.data.filter(
-						(c) => c.type === collectionType,
-					),
+					data: networkCollections.data.filter((c) => c.type === collectionType),
 				};
 
 				if (
 					currentCollections &&
-					JSON.stringify(currentCollections.data) !==
-						JSON.stringify(filtered.data)
+					JSON.stringify(currentCollections.data) !== JSON.stringify(filtered.data)
 				) {
 					queryClient.setQueryData(
 						["collections", collectionType, username],
@@ -693,8 +857,12 @@ export default function CollectionsPage() {
 					);
 					queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] });
 					queryClient.invalidateQueries({ queryKey: ["episode-totals"] });
-					queryClient.invalidateQueries({ queryKey: ["anilist-airing-times"] });
-					queryClient.invalidateQueries({ queryKey: ["aired-episodes"] });
+					queryClient.invalidateQueries({
+						queryKey: ["anilist-airing-times-v2"],
+					});
+					queryClient.invalidateQueries({
+						queryKey: ["episodes-schedule-v2"],
+					});
 				}
 
 				if (
@@ -713,7 +881,7 @@ export default function CollectionsPage() {
 		return () => {
 			cancelled = true;
 		};
-	}, [collectionType, username, collectionsQuery.data]);
+	}, [collectionType, username, collectionsQuery.data, queryClient]);
 
 	// --- Merge all data sources ---
 	const enrichedCollections = useMemo(() => {
@@ -752,22 +920,26 @@ export default function CollectionsPage() {
 		});
 	}, [rawCollections, totalEpBackfill, episodeTotals]);
 
-	// --- Sort with real data ---
+	// --- Sort and label from one clock snapshot ---
 	const collections = useMemo(() => {
 		const sorted: SortedCollection[] = sortCollections(
 			enrichedCollections,
 			calendarQuery.data ?? [],
-			today,
-			episodeMap,
-			airingTimeMap,
+			{
+				nowMs,
+				airedEpMap: episodeMap,
+				airingSignalMap: airingObservationMap,
+				nextAiringAtMap,
+			},
 		);
 		return sorted.filter((sc) => matchesSearch(sc.collection, searchQuery));
 	}, [
 		enrichedCollections,
 		calendarQuery.data,
-		today,
+		nowMs,
 		episodeMap,
-		airingTimeMap,
+		airingObservationMap,
+		nextAiringAtMap,
 		searchQuery,
 	]);
 
@@ -779,13 +951,12 @@ export default function CollectionsPage() {
 				getDisplayLabel(
 					sc.collection,
 					{ group: sc.group, weekday: sc.weekday, airedEp: sc.airedEp },
-					today,
-					airingTimeMap,
+					{ nowMs, nextAiringAtMap },
 				),
 			);
 		}
 		return map;
-	}, [collections, today, airingTimeMap]);
+	}, [collections, nowMs, nextAiringAtMap]);
 
 	// --- Pagination ---
 	const totalPages = Math.max(1, Math.ceil(collections.length / PAGE_SIZE));
@@ -856,6 +1027,28 @@ export default function CollectionsPage() {
 		if (!username) return;
 		setRefreshing(true);
 		try {
+			airingRefreshGenerationRef.current += 1;
+			await Promise.all([
+				queryClient.cancelQueries({
+					queryKey: ["anilist-airing-times-cache-v2"],
+				}),
+				queryClient.cancelQueries({
+					queryKey: ["anilist-airing-times-v2"],
+				}),
+				queryClient.cancelQueries({ queryKey: ["episodes-schedule-v2"] }),
+			]);
+			await Promise.all([
+				deleteCachedValuesByPrefix(AIRING_CACHE_PREFIX),
+				deleteCachedValuesByPrefix(LEGACY_AIRING_CACHE_PREFIX),
+				deleteCachedValuesByPrefix(EPISODES_CACHE_PREFIX),
+				deleteCachedValuesByPrefix(LEGACY_EPISODES_CACHE_PREFIX),
+			]);
+			queryClient.removeQueries({
+				queryKey: ["anilist-airing-times-cache-v2"],
+			});
+			queryClient.removeQueries({ queryKey: ["anilist-airing-times-v2"] });
+			queryClient.removeQueries({ queryKey: ["episodes-schedule-v2"] });
+			syncClock();
 			const [nextCollections, nextCalendar] = await Promise.all([
 				loadCollections(collectionType, username, true),
 				loadCalendar(true),
@@ -867,8 +1060,11 @@ export default function CollectionsPage() {
 			queryClient.setQueryData(["calendar"], nextCalendar);
 			queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] });
 			queryClient.invalidateQueries({ queryKey: ["episode-totals"] });
-			queryClient.invalidateQueries({ queryKey: ["anilist-airing-times"] });
-			queryClient.invalidateQueries({ queryKey: ["aired-episodes"] });
+			queryClient.invalidateQueries({
+				queryKey: ["anilist-airing-times-cache-v2"],
+			});
+			queryClient.invalidateQueries({ queryKey: ["anilist-airing-times-v2"] });
+			queryClient.invalidateQueries({ queryKey: ["episodes-schedule-v2"] });
 		} catch (error) {
 			alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
 		} finally {
@@ -951,10 +1147,7 @@ export default function CollectionsPage() {
 							}
 							ItemSeparatorComponent={() => <View style={styles.separator} />}
 							ListEmptyComponent={
-								<EmptyState
-									title="没有匹配条目"
-									detail="调整搜索词或切换收藏类型"
-								/>
+								<EmptyState title="没有匹配条目" detail="调整搜索词或切换收藏类型" />
 							}
 							renderSectionHeader={
 								isWatching
@@ -964,15 +1157,10 @@ export default function CollectionsPage() {
 											return (
 												<View style={styles.groupHeader}>
 													<View
-														style={[
-															styles.groupHeaderBar,
-															{ backgroundColor: s.color },
-														]}
+														style={[styles.groupHeaderBar, { backgroundColor: s.color }]}
 													/>
 													<Text style={styles.groupHeaderTitle}>{s.title}</Text>
-													<Text style={styles.groupHeaderCount}>
-														· {s.count}
-													</Text>
+													<Text style={styles.groupHeaderCount}>· {s.count}</Text>
 												</View>
 											);
 										}
@@ -991,9 +1179,7 @@ export default function CollectionsPage() {
 										title={title}
 										subtitle={subject.name}
 										coverUrl={getPreferredSubjectCoverUrl(subject)}
-										accentColor={
-											isWatching ? GROUP_COLOR[item.group] : undefined
-										}
+										accentColor={isWatching ? GROUP_COLOR[item.group] : undefined}
 										label={label}
 										progress={`${c.ep_status}/${total || "?"} 集`}
 										meta={[
@@ -1015,9 +1201,7 @@ export default function CollectionsPage() {
 
 			{collectionTask ? (
 				<View pointerEvents="box-none" style={styles.taskDock}>
-					<View
-						style={[styles.taskCapsule, taskPanelExpanded && styles.taskPanel]}
-					>
+					<View style={[styles.taskCapsule, taskPanelExpanded && styles.taskPanel]}>
 						<Pressable
 							style={styles.taskHeader}
 							onPress={() => setTaskPanelExpanded((value) => !value)}
@@ -1039,9 +1223,7 @@ export default function CollectionsPage() {
 									}
 									size={16}
 									color={
-										collectionTask.status === "failed"
-											? colors.danger
-											: colors.primary
+										collectionTask.status === "failed" ? colors.danger : colors.primary
 									}
 								/>
 							</View>
@@ -1104,11 +1286,7 @@ export default function CollectionsPage() {
 												style={styles.taskActionButton}
 												onPress={() => void retryCollectionTask(task.id)}
 											>
-												<Ionicons
-													name="refresh"
-													size={15}
-													color={colors.primary}
-												/>
+												<Ionicons name="refresh" size={15} color={colors.primary} />
 											</Pressable>
 										) : null}
 										{task.status !== "running" ? (

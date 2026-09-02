@@ -50,6 +50,10 @@ import { useAlert } from "../../src/components/Dialog";
 import { saveImageToGallery } from "../../src/utils/saveImage";
 import { showToast } from "../../src/utils/toast";
 import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
+import {
+  getCrossSeasonEpisodeOffset,
+  isCrossSeasonCountEnabled,
+} from "../../src/api/cross-season-count";
 
 function CopyText({ text, copyText, style, children }: { text: string; copyText?: () => Promise<string>; style?: object; children?: React.ReactNode }) {
   const alert = useAlert();
@@ -423,6 +427,18 @@ export default function SubjectDetailPage() {
   const episodes = episodesQuery.data;
   const collection = collectionQuery.data;
   const totalEp = getTotalEpisodes(subject, episodes);
+
+  const [crossSeasonCount, setCrossSeasonCount] = useState(false);
+  useEffect(() => {
+    void isCrossSeasonCountEnabled().then(setCrossSeasonCount);
+  }, []);
+
+  // 跨季连续计数只影响展示层，提交给 API 的进度值不变。
+  const episodeOffset = crossSeasonCount
+    ? getCrossSeasonEpisodeOffset(episodes?.data ?? [])
+    : 0;
+  const displayedTotalEp = totalEp + episodeOffset;
+
   const subjectCollectionTasks = useMemo(
     () => collectionTasks.filter((task) => task.payload.subjectId === subjectId),
     [collectionTasks, subjectId],
@@ -437,7 +453,7 @@ export default function SubjectDetailPage() {
   const currentCollectionType = optimisticCollectionPatch?.type ?? collection?.type;
   const displayEp = targetEp ?? currentEp;
   const isDirty = targetEp !== null && targetEp !== currentEp;
-  const progress = totalEp > 0 ? displayEp / totalEp : 0;
+  const progress = displayedTotalEp > 0 ? (displayEp + episodeOffset) / displayedTotalEp : 0;
   const hasKnownTotalEp = totalEp > 0;
   const canDecreaseProgress = displayEp > 0;
   const canIncreaseProgress = !hasKnownTotalEp || displayEp < totalEp;
@@ -493,7 +509,7 @@ export default function SubjectDetailPage() {
     return new Promise((resolve) => {
       alert(
         "保存后标记为看过？",
-        `观看进度将保存为 ${progressTarget} / ${totalEp} 集，是否在保存成功后标记为「看过」？`,
+        `观看进度将保存为 ${progressTarget + episodeOffset} / ${totalEp + episodeOffset} 集，是否在保存成功后标记为「看过」？`,
         [
           { text: "仅保存进度", style: "cancel", onPress: () => resolve(false) },
           { text: "保存并标记", onPress: () => resolve(true) },
@@ -658,7 +674,7 @@ export default function SubjectDetailPage() {
 
       <Section title="观看进度">
         <View style={styles.progressHeader}>
-          <Text style={styles.progressText}>{displayEp} / {totalEp || "?"}</Text>
+          <Text style={styles.progressText}>{displayEp + episodeOffset} / {displayedTotalEp || "?"}</Text>
           <Text style={[styles.muted, failedCollectionTask && !isDirty ? styles.dangerText : null]}>
             {isDirty
               ? "待提交"

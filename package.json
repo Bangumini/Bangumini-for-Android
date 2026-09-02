@@ -5,8 +5,9 @@
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start",
-    "android": "expo run:android",
+    "android": "expo run:android --app-id com.bangumini.app.dev",
     "prebuild:android": "NODE_OPTIONS=\"--no-experimental-strip-types\" npx expo prebuild --platform android",
+    "test": "node --experimental-strip-types scripts/test-airing-schedule.mjs && node --experimental-strip-types scripts/test-airing-timezones.mjs && node --experimental-strip-types scripts/test-airing-cache.mjs && node --experimental-strip-types scripts/test-anilist-airing.mjs && node --experimental-strip-types scripts/test-bgm-episodes.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "ios": "expo run:ios"
@@ -45,6 +46,7 @@
   "devDependencies": {
     "@types/react": "~18.3.12",
     "eslint": "^9.0.0",
+    "eslint-config-expo": "^57.0.1",
     "typescript": "~5.6.3"
   }
 }

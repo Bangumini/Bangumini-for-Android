@@ -22,4 +22,5 @@ yarn-error.log*
 .omo/
 AGENTS.md
 CONTEXT.md
-docs/adr
+docs/adr/
+.zcode/

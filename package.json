@@ -7,7 +7,7 @@
     "start": "expo start",
     "android": "expo run:android --app-id com.bangumini.app.dev",
     "prebuild:android": "NODE_OPTIONS=\"--no-experimental-strip-types\" npx expo prebuild --platform android",
-    "test": "node --experimental-strip-types scripts/test-airing-schedule.mjs && node --experimental-strip-types scripts/test-airing-timezones.mjs && node --experimental-strip-types scripts/test-airing-cache.mjs && node --experimental-strip-types scripts/test-anilist-airing.mjs && node --experimental-strip-types scripts/test-bgm-episodes.mjs",
+    "test": "node --experimental-strip-types scripts/test-airing-schedule.mjs && node --experimental-strip-types scripts/test-airing-timezones.mjs && node --experimental-strip-types scripts/test-airing-cache.mjs && node --experimental-strip-types scripts/test-anilist-airing.mjs && node --experimental-strip-types scripts/test-bgm-episodes.mjs && node --experimental-strip-types scripts/test-subject-title-copy.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "ios": "expo run:ios"

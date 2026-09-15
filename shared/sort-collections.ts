@@ -24,6 +24,20 @@ function getTotalEp(c: UserCollection): number {
 	return c.subject.total_episodes || c.subject.eps || 0;
 }
 
+/**
+ * 用户对条目的投入程度：完成度为主、已观看集数为辅，减少短篇比例偏置。
+ * 总集数未知时返回 null，调用方应回退至更新时间排序。
+ */
+export function getInterestWeight(c: UserCollection): number | null {
+	const totalEp = getTotalEp(c);
+	if (!Number.isFinite(totalEp) || totalEp <= 0) return null;
+
+	const watchedEp = Math.min(Math.max(c.ep_status, 0), totalEp);
+	const completion = watchedEp / totalEp;
+	const viewingDepth = Math.min(watchedEp / 6, 1);
+	return 0.75 * completion + 0.25 * viewingDepth;
+}
+
 function getWeekdayFromDate(dateStr: string): number {
 	const [year, month, day] = dateStr.split("-").map(Number);
 	if (!year || !month || !day) return 0;
@@ -132,8 +146,9 @@ export function sortCollections(
 		groups[meta.group].push({ c, meta });
 	}
 
-	// 与桌面版一致：Group I / III 先按 weekdayOffset 升序（weekday 优先取
-	// nextAiringAt 推出的星期），同天再用精确播出时间戳裁决，名称兜底。
+	// Group I 的兴趣权重相同、总集数未知条目，以及 Group III：先按
+	// weekdayOffset 升序（weekday 优先取 nextAiringAt 推出的星期），同天再用
+	// 精确播出时间戳裁决，名称兜底。
 	const today = getTodayBangumiWeekday(options.nowMs);
 	const sortByWeekdayThenTime = (
 		a: { c: UserCollection },
@@ -156,7 +171,20 @@ export function sortCollections(
 		);
 	};
 
-	groups.airing_not_caught.sort(sortByWeekdayThenTime);
+	groups.airing_not_caught.sort((a, b) => {
+		const weightA = getInterestWeight(a.c);
+		const weightB = getInterestWeight(b.c);
+
+		// 总集数已知的条目优先；双方均已知时严格按兴趣权重降序。
+		if (weightA !== null && weightB !== null) {
+			const weightDiff = weightB - weightA;
+			if (weightDiff !== 0) return weightDiff;
+		} else if (weightA !== null || weightB !== null) {
+			return weightA === null ? 1 : -1;
+		}
+
+		return sortByWeekdayThenTime(a, b);
+	});
 	groups.airing_caught.sort(sortByWeekdayThenTime);
 	groups.pre_air.sort((a, b) =>
 		(a.c.subject.date || "").localeCompare(b.c.subject.date || ""),

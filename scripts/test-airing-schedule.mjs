@@ -5,8 +5,11 @@ import {
 	deriveAiredEpisodeCount,
 	deriveAiringSchedule,
 	getEffectiveAiringAt,
+	getLatestEpisodeAiringAt,
 	getNextEpisodeAiringAt,
+	getNextRecentAiringExpiry,
 	getNextScheduleBoundary,
+	isRecentlyAired,
 	getNextTokyoDayBoundary,
 } from "../shared/airing-schedule.ts";
 import {
@@ -219,6 +222,45 @@ assert.equal(
 	getNextScheduleBoundary([episodeBoundary], clockNow),
 	episodeBoundary,
 	"剧集边界早于 JST 日界时必须优先唤醒",
+);
+const lateNightAiringAt = jstTimestamp("2026-08-22", 1, 30);
+assert.equal(
+	getLatestEpisodeAiringAt(
+		lateNightEpisodes,
+		lateNightSchedule,
+		lateNightAiringAt,
+	),
+	lateNightAiringAt,
+	"调度器应找到最近一次已播出的精确时间",
+);
+assert.equal(
+	isRecentlyAired(
+		lateNightAiringAt,
+		lateNightAiringAt + 6 * 60 * 60 * 1000 - 1,
+	),
+	true,
+	"更新后的六小时内应显示刚更新标识",
+);
+assert.equal(
+	isRecentlyAired(
+		lateNightAiringAt,
+		lateNightAiringAt + 6 * 60 * 60 * 1000,
+	),
+	false,
+	"更新满六小时后不应继续显示刚更新标识",
+);
+assert.equal(
+	getLatestEpisodeAiringAt(lateNightEpisodes, null, lateNightAiringAt),
+	null,
+	"缺少精确排期时不应推测刚更新标识",
+);
+assert.equal(
+	getNextRecentAiringExpiry(
+		[lateNightAiringAt, lateNightAiringAt - 60 * 60 * 1000],
+		lateNightAiringAt,
+	),
+	lateNightAiringAt + 5 * 60 * 60 * 1000,
+	"应优先安排最早的刚更新标签失效边界",
 );
 assert.equal(
 	getNextScheduleBoundary([], clockNow),

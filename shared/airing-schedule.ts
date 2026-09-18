@@ -1,4 +1,6 @@
 export const LATE_NIGHT_CUTOFF_MINUTES = 6 * 60;
+/** 最近一集精确播出后显示“刚更新”标签的时长。 */
+export const RECENT_AIRING_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 
@@ -176,4 +178,51 @@ export function getNextEpisodeAiringAt(
 		}
 	}
 	return nextAiringAt;
+}
+
+/** 返回截至当前时刻最近已播一集的精确首播时间；无可靠排期时返回 null。 */
+export function getLatestEpisodeAiringAt(
+	episodes: AiringEpisode[],
+	schedule: AiringSchedule | null,
+	nowMs: number,
+): number | null {
+	if (!schedule) return null;
+
+	let latestAiringAt: number | null = null;
+	for (const episode of episodes) {
+		if (!episode.airdate) continue;
+		const airingAt = getEffectiveAiringAt(episode, schedule);
+		if (airingAt > nowMs) continue;
+		if (latestAiringAt === null || airingAt > latestAiringAt) {
+			latestAiringAt = airingAt;
+		}
+	}
+	return latestAiringAt;
+}
+
+/** 是否仍处于最近一集播出后的“刚更新”提示窗口内。 */
+export function isRecentlyAired(
+	latestAiringAt: number | null | undefined,
+	nowMs: number,
+): boolean {
+	return (
+		latestAiringAt !== null &&
+		latestAiringAt !== undefined &&
+		nowMs >= latestAiringAt &&
+		nowMs - latestAiringAt < RECENT_AIRING_WINDOW_MS
+	);
+}
+
+/** 返回仍有效的“刚更新”标签中最早的失效时刻。 */
+export function getNextRecentAiringExpiry(
+	latestAiringAts: Iterable<number>,
+	nowMs: number,
+): number | null {
+	let nextExpiry: number | null = null;
+	for (const airingAt of latestAiringAts) {
+		const expiry = airingAt + RECENT_AIRING_WINDOW_MS;
+		if (expiry <= nowMs) continue;
+		if (nextExpiry === null || expiry < nextExpiry) nextExpiry = expiry;
+	}
+	return nextExpiry;
 }

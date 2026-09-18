@@ -50,8 +50,11 @@ import {
 import {
 	deriveAiredEpisodeCount,
 	deriveAiringSchedule,
+	getLatestEpisodeAiringAt,
 	getNextEpisodeAiringAt,
+	getNextRecentAiringExpiry,
 	getNextScheduleBoundary,
+	isRecentlyAired,
 	type AiringObservation,
 	type AiringSchedule,
 } from "../../shared/airing-schedule";
@@ -211,6 +214,7 @@ function deriveAiringMaps(
 	const scheduleMap = new Map<number, AiringSchedule>();
 	const airedEpMap = new Map<number, number>();
 	const nextAiringAtMap = new Map<number, number>();
+	const latestAiringAtMap = new Map<number, number>();
 	for (const [subjectId, episodes] of episodeListMap) {
 		const observation = observationMap.get(subjectId);
 		const schedule = observation
@@ -220,8 +224,30 @@ function deriveAiringMaps(
 		airedEpMap.set(subjectId, deriveAiredEpisodeCount(episodes, schedule, nowMs));
 		const nextAiringAt = getNextEpisodeAiringAt(episodes, schedule, nowMs);
 		if (nextAiringAt !== null) nextAiringAtMap.set(subjectId, nextAiringAt);
+		const latestAiringAt = getLatestEpisodeAiringAt(episodes, schedule, nowMs);
+		if (latestAiringAt !== null) latestAiringAtMap.set(subjectId, latestAiringAt);
 	}
-	return { scheduleMap, airedEpMap, nextAiringAtMap };
+	return { scheduleMap, airedEpMap, nextAiringAtMap, latestAiringAtMap };
+}
+
+function getJustUpdatedSubjectIds(
+	sorted: SortedCollection[],
+	latestAiringAtMap: ReadonlyMap<number, number>,
+	nowMs: number,
+): Set<number> {
+	const subjectIds = new Set<number>();
+	for (const item of sorted) {
+		if (
+			item.group === "airing_not_caught" &&
+			isRecentlyAired(
+				latestAiringAtMap.get(item.collection.subject_id),
+				nowMs,
+			)
+		) {
+			subjectIds.add(item.collection.subject_id);
+		}
+	}
+	return subjectIds;
 }
 
 async function loadCollections(
@@ -779,24 +805,41 @@ export default function CollectionsPage() {
 	);
 	const episodeMap = derivedAiringData.airedEpMap;
 	const nextAiringAtMap = derivedAiringData.nextAiringAtMap;
+	const latestAiringAtMap = derivedAiringData.latestAiringAtMap;
 
 	useEffect(() => {
 		if (!isWatching || !isPageFocused) return;
-		const nextBoundary = getNextScheduleBoundary(nextAiringAtMap.values(), nowMs);
+		const nextScheduleBoundary = getNextScheduleBoundary(
+			nextAiringAtMap.values(),
+			nowMs,
+		);
+		const recentTagExpiry = getNextRecentAiringExpiry(
+			latestAiringAtMap.values(),
+			nowMs,
+		);
+		const nextClockBoundary = Math.min(
+			nextScheduleBoundary,
+			recentTagExpiry ?? Number.POSITIVE_INFINITY,
+		);
+		const shouldRefreshAiring =
+			nextScheduleBoundary <= (recentTagExpiry ?? Number.POSITIVE_INFINITY);
 		const timer = setTimeout(
 			() => {
 				syncClock();
-				void queryClient.invalidateQueries({
-					queryKey: ["anilist-airing-times-v2"],
-				});
+				if (shouldRefreshAiring) {
+					void queryClient.invalidateQueries({
+						queryKey: ["anilist-airing-times-v2"],
+					});
+				}
 			},
-			Math.max(1000, nextBoundary - Date.now() + CLOCK_EPSILON_MS),
+			Math.max(1000, nextClockBoundary - Date.now() + CLOCK_EPSILON_MS),
 		);
 		return () => clearTimeout(timer);
 	}, [
 		isWatching,
 		isPageFocused,
 		nextAiringAtMap,
+		latestAiringAtMap,
 		nowMs,
 		queryClient,
 		syncClock,
@@ -942,6 +985,11 @@ export default function CollectionsPage() {
 		nextAiringAtMap,
 		searchQuery,
 	]);
+
+	const justUpdatedSubjectIds = useMemo(
+		() => getJustUpdatedSubjectIds(collections, latestAiringAtMap, nowMs),
+		[collections, latestAiringAtMap, nowMs],
+	);
 
 	const displayLabelMap = useMemo(() => {
 		const map = new Map<number, string | null>();
@@ -1174,12 +1222,16 @@ export default function CollectionsPage() {
 								const label = isWatching
 									? (displayLabelMap.get(c.subject_id) ?? undefined)
 									: undefined;
+								const badges = justUpdatedSubjectIds.has(c.subject_id)
+									? [{ text: "刚更新", tone: "recent" as const }]
+									: undefined;
 								return (
 									<SubjectCard
 										title={title}
 										subtitle={subject.name}
 										coverUrl={getPreferredSubjectCoverUrl(subject)}
 										accentColor={isWatching ? GROUP_COLOR[item.group] : undefined}
+										badges={badges}
 										label={label}
 										progress={`${c.ep_status}/${total || "?"} 集`}
 										meta={[

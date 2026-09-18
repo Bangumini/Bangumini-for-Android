@@ -3,12 +3,18 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { colors } from "../theme/colors";
 import CachedImage from "./CachedImage";
 
+export type SubjectCardBadge = {
+	text: string;
+	tone?: "default" | "recent";
+};
+
 type SubjectCardProps = {
 	title: string;
 	subtitle?: string | null;
 	coverUrl?: string | null;
 	meta?: string[];
 	label?: string | null;
+	badges?: SubjectCardBadge[];
 	progress?: string | null;
 	accentColor?: string;
 	onPress?: () => void;
@@ -21,6 +27,7 @@ export function SubjectCard({
 	coverUrl,
 	meta = [],
 	label,
+	badges = [],
 	progress,
 	accentColor,
 	onPress,
@@ -42,10 +49,26 @@ export function SubjectCard({
 					<Text style={styles.title} numberOfLines={2}>
 						{title}
 					</Text>
-					{label ? (
-						<Text style={styles.label} numberOfLines={1}>
-							{label}
-						</Text>
+					{badges.length > 0 || label ? (
+						<View style={styles.badgeColumn}>
+							{badges.map((badge) => (
+								<Text
+									key={`${badge.tone ?? "default"}-${badge.text}`}
+									style={[
+										styles.label,
+										badge.tone === "recent" && styles.recentLabel,
+									]}
+									numberOfLines={1}
+								>
+									{badge.text}
+								</Text>
+							))}
+							{label ? (
+								<Text style={styles.label} numberOfLines={1}>
+									{label}
+								</Text>
+							) : null}
+						</View>
 					) : null}
 				</View>
 				{subtitle ? (
@@ -109,6 +132,11 @@ const styles = StyleSheet.create({
 		lineHeight: 21,
 		fontWeight: "700",
 	},
+	badgeColumn: {
+		maxWidth: 112,
+		alignItems: "flex-end",
+		gap: 4,
+	},
 	label: {
 		maxWidth: 112,
 		paddingHorizontal: 8,
@@ -119,6 +147,10 @@ const styles = StyleSheet.create({
 		backgroundColor: colors.primaryMuted,
 		fontSize: 12,
 		fontWeight: "700",
+	},
+	recentLabel: {
+		color: colors.success,
+		backgroundColor: "#284329",
 	},
 	subtitle: {
 		color: colors.muted,

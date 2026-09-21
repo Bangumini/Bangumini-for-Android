@@ -1,6 +1,6 @@
-import { Component, useCallback, useEffect, useState, type ReactNode } from "react";
+import { Component, useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
-import { Stack } from "expo-router";
+import { router, Stack } from "expo-router";
 import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
@@ -9,12 +9,17 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import Ionicons from "@expo/vector-icons/Ionicons";
-import { getAccessToken } from "../src/api/oauth";
+import {
+  AuthRefreshUnavailableError,
+  AuthSessionExpiredError,
+  getAccessTokenContext,
+  invalidateAuthSession,
+} from "../src/api/oauth";
 import { startCollectionTaskWorker } from "../src/api/collection-tasks";
-import { DialogProvider } from "../src/components/Dialog";
-import { useAuth } from "../src/hooks/useAuth";
+import { DialogProvider, useAlert } from "../src/components/Dialog";
+import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { colors } from "../src/theme/colors";
-import { setTokenProvider } from "../shared/api/client";
+import { setTokenProvider, setUnauthorizedHandler } from "../shared/api/client";
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -51,6 +56,28 @@ class RootErrorBoundary extends Component<{ children: ReactNode }, RootErrorBoun
   }
 }
 
+function AuthSessionGuard() {
+  const alert = useAlert();
+  const queryClient = useQueryClient();
+  const { sessionExpired, acknowledgeSessionExpired } = useAuth();
+
+  useEffect(() => {
+    if (!sessionExpired) return;
+
+    acknowledgeSessionExpired();
+    queryClient.clear();
+    router.replace("/login");
+    alert("登录状态已过期", "请重新登录后继续同步收藏和观看进度");
+  }, [
+    acknowledgeSessionExpired,
+    alert,
+    queryClient,
+    sessionExpired,
+  ]);
+
+  return null;
+}
+
 function CollectionTaskWorkerBootstrap() {
   const queryClient = useQueryClient();
   const { checking, loggedIn } = useAuth();
@@ -77,12 +104,21 @@ export default function RootLayout() {
   }));
 
   useEffect(() => {
-    setTokenProvider(async () => {
+    setTokenProvider(async (options) => {
       try {
-        return await getAccessToken();
-      } catch {
+        return await getAccessTokenContext(options);
+      } catch (error) {
+        if (
+          error instanceof AuthSessionExpiredError ||
+          error instanceof AuthRefreshUnavailableError
+        ) {
+          throw error;
+        }
         return "";
       }
+    });
+    setUnauthorizedHandler(async ({ token, sessionId }) => {
+      await invalidateAuthSession(token, sessionId);
     });
     setReady(true);
   }, []);
@@ -103,21 +139,27 @@ export default function RootLayout() {
         <SafeAreaProvider>
           <QueryClientProvider client={queryClient}>
             <DialogProvider>
-              <CollectionTaskWorkerBootstrap />
-              <StatusBar style="light" />
-              <Stack
-              screenOptions={{
-                headerStyle: { backgroundColor: colors.background },
-                headerTintColor: colors.text,
-                headerTitleStyle: { fontWeight: "700" },
-                contentStyle: { backgroundColor: colors.background },
-              }}
-            >
-              <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-              <Stack.Screen name="login" options={{ title: "登录", presentation: "modal" }} />
-              <Stack.Screen name="subject/[id]" options={{ title: "条目详情" }} />
-              <Stack.Screen name="oauth/callback" options={{ headerShown: false, presentation: "modal" }} />
-            </Stack>
+              <AuthProvider>
+                <AuthSessionGuard />
+                <CollectionTaskWorkerBootstrap />
+                <StatusBar style="light" />
+                <Stack
+                  screenOptions={{
+                    headerStyle: { backgroundColor: colors.background },
+                    headerTintColor: colors.text,
+                    headerTitleStyle: { fontWeight: "700" },
+                    contentStyle: { backgroundColor: colors.background },
+                  }}
+                >
+                  <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                  <Stack.Screen name="login" options={{ title: "登录", presentation: "modal" }} />
+                  <Stack.Screen name="subject/[id]" options={{ title: "条目详情" }} />
+                  <Stack.Screen
+                    name="oauth/callback"
+                    options={{ headerShown: false, presentation: "modal" }}
+                  />
+                </Stack>
+              </AuthProvider>
             </DialogProvider>
           </QueryClientProvider>
         </SafeAreaProvider>

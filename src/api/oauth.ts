@@ -12,6 +12,78 @@ const CLIENT_SECRET = "29dbdbd38d77fa4b23d32a05a7c9ebce";
 const AUTHORIZE_URL = "https://bgm.tv/oauth/authorize";
 const TOKEN_URL = "https://bgm.tv/oauth/access_token";
 
+export class AuthSessionExpiredError extends Error {
+	constructor() {
+		super("登录状态已过期，请重新登录");
+		this.name = "AuthSessionExpiredError";
+	}
+}
+
+export class AuthRefreshUnavailableError extends Error {
+	constructor() {
+		super("登录状态暂时无法续期，请稍后重试");
+		this.name = "AuthRefreshUnavailableError";
+	}
+}
+
+class NotAuthenticatedError extends Error {
+	constructor() {
+		super("Not authenticated");
+		this.name = "NotAuthenticatedError";
+	}
+}
+
+type AuthSessionExpiredListener = () => void;
+
+const authSessionExpiredListeners = new Set<AuthSessionExpiredListener>();
+let authSessionRevision = 0;
+let authSessionGeneration = 0;
+let credentialMutationQueue: Promise<void> = Promise.resolve();
+
+function mutateCredentials<T>(mutation: () => Promise<T>): Promise<T> {
+	const result = credentialMutationQueue.then(mutation, mutation);
+	credentialMutationQueue = result.then(
+		() => undefined,
+		() => undefined,
+	);
+	return result;
+}
+
+async function readCredentialSnapshot() {
+	return mutateCredentials(async () => {
+		const [token, refreshToken, expiry] = await Promise.all([
+			getItem(TOKEN_KEY),
+			getItem(REFRESH_KEY),
+			getItem(EXPIRY_KEY),
+		]);
+		return {
+			revision: authSessionRevision,
+			sessionGeneration: authSessionGeneration,
+			token,
+			refreshToken,
+			expiry,
+		};
+	});
+}
+
+async function removeStoredCredentials() {
+	await Promise.all([
+		removeItem(TOKEN_KEY),
+		removeItem(REFRESH_KEY),
+		removeItem(EXPIRY_KEY),
+		removeItem(USERNAME_KEY),
+	]);
+}
+
+export function subscribeAuthSessionExpired(
+	listener: AuthSessionExpiredListener,
+) {
+	authSessionExpiredListeners.add(listener);
+	return () => {
+		authSessionExpiredListeners.delete(listener);
+	};
+}
+
 WebBrowser.maybeCompleteAuthSession();
 
 async function getItem(key: string) {
@@ -34,54 +106,129 @@ export function getRedirectUri() {
 }
 
 export async function isLoggedIn(): Promise<boolean> {
-	const token = await getItem(TOKEN_KEY);
-	if (!token) return false;
-
-	// 检查 token 是否过期，如果过期则尝试刷新
-	const expiry = await getItem(EXPIRY_KEY);
-	if (expiry && Date.now() > Number(expiry)) {
-		const refreshed = await refreshAccessToken();
-		// 刷新失败时不直接清除 token，让 API 调用自行判断
-		// （token 过期时间可能有容差，refresh_token 也可能过期）
-		return !!refreshed || !!token;
+	try {
+		await getAccessToken();
+		return true;
+	} catch (error) {
+		if (error instanceof AuthSessionExpiredError) return false;
+		if (error instanceof NotAuthenticatedError) return false;
+		if (error instanceof AuthRefreshUnavailableError) return true;
+		throw error;
 	}
-
-	return true;
 }
 
-export async function getAccessToken(): Promise<string> {
-	const expiry = await getItem(EXPIRY_KEY);
-	if (expiry && Date.now() > Number(expiry)) {
-		const refreshed = await refreshAccessToken();
-		if (refreshed) return refreshed;
-		// 刷新失败不立即清除 token — token 过期时间可能有容差
-		// 且 refresh_token 也可能过期，此时应保留旧 token 让 API 自行返回 401
+export type AccessTokenOptions = {
+	forceRefresh?: boolean;
+	rejectedToken?: string;
+	rejectedSessionId?: number;
+};
+
+export async function getAccessToken(
+	options: AccessTokenOptions = {},
+): Promise<string> {
+	const snapshot = await readCredentialSnapshot();
+	if (
+		options.forceRefresh &&
+		((options.rejectedToken && snapshot.token !== options.rejectedToken) ||
+			(options.rejectedSessionId !== undefined &&
+				snapshot.sessionGeneration !== options.rejectedSessionId))
+	) {
+		if (!snapshot.token) throw new NotAuthenticatedError();
+		return snapshot.token;
 	}
 
-	const token = await getItem(TOKEN_KEY);
-	if (!token) throw new Error("Not authenticated");
-	return token;
+	if (
+		options.forceRefresh ||
+		(snapshot.expiry && Date.now() > Number(snapshot.expiry))
+	) {
+		const refreshed = await refreshAccessToken(snapshot.revision);
+		if (refreshed) return refreshed;
+		await invalidateAuthSession(
+			snapshot.token ?? undefined,
+			snapshot.sessionGeneration,
+		);
+		throw new AuthSessionExpiredError();
+	}
+
+	if (!snapshot.token) throw new NotAuthenticatedError();
+	return snapshot.token;
+}
+
+export type AccessTokenContext = {
+	token: string;
+	sessionId: number;
+};
+
+export async function getAccessTokenContext(
+	options: AccessTokenOptions = {},
+): Promise<AccessTokenContext> {
+	const token = await getAccessToken(options);
+	const snapshot = await readCredentialSnapshot();
+	if (!snapshot.token) throw new NotAuthenticatedError();
+	return {
+		token: snapshot.token === token ? token : snapshot.token,
+		sessionId: snapshot.sessionGeneration,
+	};
 }
 
 export async function getUsername(): Promise<string> {
-	return (await getItem(USERNAME_KEY)) ?? "";
+	return mutateCredentials(async () => (await getItem(USERNAME_KEY)) ?? "");
 }
 
 export async function setToken(token: string) {
-	await setItem(TOKEN_KEY, token.trim());
+	await mutateCredentials(async () => {
+		authSessionRevision += 1;
+		authSessionGeneration += 1;
+		await removeStoredCredentials();
+		await setItem(TOKEN_KEY, token.trim());
+	});
+}
+
+export async function setTokenExpiry(token: string, expiry: number) {
+	await mutateCredentials(async () => {
+		if ((await getItem(TOKEN_KEY)) !== token) return;
+		await setItem(EXPIRY_KEY, String(expiry));
+	});
 }
 
 export async function clearToken() {
-	await Promise.all([
-		removeItem(TOKEN_KEY),
-		removeItem(REFRESH_KEY),
-		removeItem(EXPIRY_KEY),
-		removeItem(USERNAME_KEY),
-	]);
+	await mutateCredentials(async () => {
+		authSessionRevision += 1;
+		authSessionGeneration += 1;
+		await removeStoredCredentials();
+	});
+}
+
+export async function invalidateAuthSession(
+	expectedToken?: string,
+	expectedSessionId?: number,
+) {
+	let invalidated = false;
+	await mutateCredentials(async () => {
+		const currentToken = await getItem(TOKEN_KEY);
+		if (expectedToken && currentToken !== expectedToken) return;
+		if (
+			expectedSessionId !== undefined &&
+			authSessionGeneration !== expectedSessionId
+		) {
+			return;
+		}
+		if (!currentToken) return;
+
+		authSessionRevision += 1;
+		authSessionGeneration += 1;
+		await removeStoredCredentials();
+		invalidated = true;
+	});
+
+	if (invalidated) {
+		authSessionExpiredListeners.forEach((listener) => listener());
+	}
+	return invalidated;
 }
 
 export async function fetchAndCacheUsername(): Promise<string> {
-	const token = await getItem(TOKEN_KEY);
+	const { token } = await readCredentialSnapshot();
 	if (!token) return "";
 
 	try {
@@ -96,8 +243,13 @@ export async function fetchAndCacheUsername(): Promise<string> {
 
 		const data = (await res.json()) as { username?: string };
 		if (data.username) {
-			await setItem(USERNAME_KEY, data.username);
-			return data.username;
+			let cached = false;
+			await mutateCredentials(async () => {
+				if ((await getItem(TOKEN_KEY)) !== token) return;
+				await setItem(USERNAME_KEY, data.username!);
+				cached = true;
+			});
+			return cached ? data.username : "";
 		}
 	} catch {
 		return "";
@@ -106,16 +258,63 @@ export async function fetchAndCacheUsername(): Promise<string> {
 	return "";
 }
 
-export async function refreshAccessToken(): Promise<string | null> {
-	const refresh = await getItem(REFRESH_KEY);
-	if (!refresh) return null;
+type AccessTokenRefreshFlight = {
+	revision: number;
+	refreshToken: string;
+	promise: Promise<string | null>;
+};
+
+let accessTokenRefreshFlight: AccessTokenRefreshFlight | null = null;
+
+export async function refreshAccessToken(
+	expectedRevision?: number,
+): Promise<string | null> {
+	const snapshot = await readCredentialSnapshot();
+	if (
+		expectedRevision !== undefined &&
+		snapshot.revision !== expectedRevision
+	) {
+		return snapshot.token;
+	}
+	if (!snapshot.refreshToken) return null;
+
+	let currentRefresh = accessTokenRefreshFlight;
+	if (
+		!currentRefresh ||
+		currentRefresh.revision !== snapshot.revision ||
+		currentRefresh.refreshToken !== snapshot.refreshToken
+	) {
+		currentRefresh = {
+			revision: snapshot.revision,
+			refreshToken: snapshot.refreshToken,
+			promise: performAccessTokenRefresh(
+				snapshot.revision,
+				snapshot.refreshToken,
+			),
+		};
+		accessTokenRefreshFlight = currentRefresh;
+	}
+
+	try {
+		return await currentRefresh.promise;
+	} finally {
+		if (accessTokenRefreshFlight === currentRefresh) {
+			accessTokenRefreshFlight = null;
+		}
+	}
+}
+
+async function performAccessTokenRefresh(
+	refreshRevision: number,
+	refreshToken: string,
+): Promise<string | null> {
 
 	try {
 		const body = new URLSearchParams();
 		body.append("grant_type", "refresh_token");
 		body.append("client_id", CLIENT_ID);
 		body.append("client_secret", CLIENT_SECRET);
-		body.append("refresh_token", refresh);
+		body.append("refresh_token", refreshToken);
 		body.append("redirect_uri", getRedirectUri());
 
 		const res = await fetch(TOKEN_URL, {
@@ -126,7 +325,8 @@ export async function refreshAccessToken(): Promise<string | null> {
 
 		if (!res.ok) {
 			console.warn("[oauth] refresh token failed, status:", res.status);
-			return null;
+			if (res.status === 400 || res.status === 401) return null;
+			throw new AuthRefreshUnavailableError();
 		}
 
 		const data = (await res.json()) as {
@@ -135,24 +335,45 @@ export async function refreshAccessToken(): Promise<string | null> {
 			expires_in?: number;
 		};
 
-		await persistTokenResponse(data);
-		return data.access_token;
+		const persisted = await persistTokenResponse(data, refreshRevision);
+		return persisted ? data.access_token : getItem(TOKEN_KEY);
 	} catch (e) {
+		if (e instanceof AuthRefreshUnavailableError) throw e;
 		console.warn("[oauth] refresh token error:", e);
-		return null;
+		throw new AuthRefreshUnavailableError();
 	}
 }
 
-async function persistTokenResponse(data: {
-	access_token: string;
-	refresh_token?: string;
-	expires_in?: number;
-}) {
-	await setItem(TOKEN_KEY, data.access_token);
-	if (data.refresh_token) await setItem(REFRESH_KEY, data.refresh_token);
-	if (data.expires_in) {
-		await setItem(EXPIRY_KEY, String(Date.now() + data.expires_in * 1000));
-	}
+async function persistTokenResponse(
+	data: {
+		access_token: string;
+		refresh_token?: string;
+		expires_in?: number;
+	},
+	expectedRevision?: number,
+) {
+	return mutateCredentials(async () => {
+		if (
+			expectedRevision !== undefined &&
+			authSessionRevision !== expectedRevision
+		) {
+			return false;
+		}
+
+		if (expectedRevision === undefined) {
+			authSessionGeneration += 1;
+			await removeStoredCredentials();
+		}
+		await setItem(TOKEN_KEY, data.access_token);
+		if (data.refresh_token) await setItem(REFRESH_KEY, data.refresh_token);
+		if (data.expires_in) {
+			await setItem(EXPIRY_KEY, String(Date.now() + data.expires_in * 1000));
+		} else {
+			await removeItem(EXPIRY_KEY);
+		}
+		authSessionRevision += 1;
+		return true;
+	});
 }
 
 async function exchangeCodeForToken(code: string) {

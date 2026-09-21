@@ -13,24 +13,61 @@ import type {
 
 const BASE_URL = "https://api.bgm.tv";
 
-let tokenProvider: (() => Promise<string>) | null = null;
+export type TokenRequestOptions = {
+  forceRefresh?: boolean;
+  rejectedToken?: string;
+  rejectedSessionId?: number;
+};
+
+export type ProvidedAuthToken = {
+  token: string;
+  sessionId: number;
+};
+
+type TokenProvider = (
+  options?: TokenRequestOptions,
+) => Promise<string | ProvidedAuthToken>;
+export type RejectedAuthSession = {
+  token?: string;
+  sessionId?: number;
+};
+type UnauthorizedHandler = (
+  rejectedSession: RejectedAuthSession,
+) => Promise<void> | void;
+
+type AuthHeaders = {
+  headers: Record<string, string>;
+  sessionId?: number;
+};
+
+let tokenProvider: TokenProvider | null = null;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
 let fetchFn: typeof fetch = fetch;
 
 export function setFetchFunction(fn: typeof fetch) {
   fetchFn = fn;
 }
 
-export function setTokenProvider(fn: () => Promise<string>) {
+export function setTokenProvider(fn: TokenProvider) {
   tokenProvider = fn;
 }
 
-async function getAuthHeaders(): Promise<Record<string, string>> {
-  let token = "";
-  try {
-    token = tokenProvider ? await tokenProvider() : "";
-  } catch {
-    token = "";
-  }
+export function setUnauthorizedHandler(fn: UnauthorizedHandler) {
+  unauthorizedHandler = fn;
+}
+
+function getBearerToken(headers: Record<string, string>) {
+  const authorization = headers.Authorization;
+  return authorization?.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : undefined;
+}
+
+async function getAuthHeaders(
+  options: TokenRequestOptions = {},
+): Promise<AuthHeaders> {
+  const provided = tokenProvider ? await tokenProvider(options) : "";
+  const token = typeof provided === "string" ? provided : provided.token;
   const headers: Record<string, string> = {
     "User-Agent": "Bangumini-for-Android/1.0",
     Accept: "application/json",
@@ -38,7 +75,10 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
-  return headers;
+  return {
+    headers,
+    sessionId: typeof provided === "string" ? undefined : provided.sessionId,
+  };
 }
 
 async function fetchWithRetry(
@@ -68,11 +108,13 @@ async function request<T>(
   maxRetries = 3,
 ): Promise<T> {
   const url = `${BASE_URL}${path}`;
-  const authHeaders = await getAuthHeaders();
-  const headers = { ...authHeaders, ...(options.headers || {}) };
+  let auth = await getAuthHeaders();
+  let headers = { ...auth.headers, ...(options.headers || {}) };
+  let retriedAfterUnauthorized = false;
+  let shouldInvalidateAfterUnauthorizedRetry = false;
 
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  for (let attempt = 0; attempt < maxRetries;) {
     const res = await fetchWithRetry(url, { ...options, headers });
 
     if (res.ok) {
@@ -88,10 +130,50 @@ async function request<T>(
     const body = await res.text();
     lastError = new Error(`Bangumi API error ${res.status}: ${body}`);
 
+    if (
+      res.status === 401 &&
+      !retriedAfterUnauthorized &&
+      Boolean(auth.headers.Authorization)
+    ) {
+      retriedAfterUnauthorized = true;
+      const rejectedToken = getBearerToken(auth.headers);
+      const latestAuth = await getAuthHeaders();
+
+      if (latestAuth.headers.Authorization !== auth.headers.Authorization) {
+        auth = latestAuth;
+      } else {
+        const rejectedSessionId = auth.sessionId;
+        const refreshedAuth = await getAuthHeaders({
+          forceRefresh: true,
+          rejectedToken,
+          ...(rejectedSessionId === undefined ? {} : { rejectedSessionId }),
+        });
+        shouldInvalidateAfterUnauthorizedRetry =
+          rejectedSessionId === undefined ||
+          refreshedAuth.sessionId === undefined ||
+          refreshedAuth.sessionId === rejectedSessionId;
+        auth = refreshedAuth;
+      }
+      headers = { ...auth.headers, ...(options.headers || {}) };
+      continue;
+    }
+
+    if (res.status === 401 && retriedAfterUnauthorized) {
+      if (shouldInvalidateAfterUnauthorizedRetry) {
+        await unauthorizedHandler?.({
+          token: getBearerToken(auth.headers),
+          sessionId: auth.sessionId,
+        });
+        throw new Error("登录状态已过期，请重新登录");
+      }
+      throw lastError;
+    }
+
     if ((res.status >= 500 && res.status < 600) || res.status === 429) {
       if (attempt < maxRetries - 1) {
         const delay = parseRetryDelay(res, body);
         await new Promise((r) => setTimeout(r, delay));
+        attempt += 1;
         continue;
       }
     }

@@ -9,7 +9,7 @@ import { colors } from "../src/theme/colors";
 
 export default function LoginPage() {
   const alert = useAlert();
-  const { loginWithToken } = useAuth();
+  const { loginWithToken, refresh } = useAuth();
   const [token, setTokenValue] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -17,6 +17,7 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await action();
+      await refresh();
       router.replace("/collections");
     } catch (error) {
       alert("登录失败", error instanceof Error ? error.message : "请稍后重试");

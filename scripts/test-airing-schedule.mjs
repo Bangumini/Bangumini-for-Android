@@ -381,4 +381,33 @@ assert.equal(
 	"BGM episodes 完全缺失时不得强制制造至少一集已播",
 );
 
+// v2 本地在播缓存回归：日历暂时缺失时，已有新版播出记录仍应支持未追上分组。
+const cachedSignalSubject = {
+	id: 900002,
+	name: "Locally Cached Airing Show",
+	name_cn: "本地缓存的在播番",
+	date: "2020-01-01",
+	eps: 12,
+	total_episodes: 12,
+};
+const cachedSignalCollection = {
+	subject_id: cachedSignalSubject.id,
+	subject: cachedSignalSubject,
+	ep_status: 3,
+};
+const cachedSignalSorted = sortCollections(
+	[cachedSignalCollection],
+	[],
+	{
+		nowMs: beforeNow,
+		airedEpMap: new Map([[cachedSignalSubject.id, 5]]),
+		airingSignalMap: new Map([[cachedSignalSubject.id, { status: "scheduled" }]]),
+	},
+);
+assert.equal(
+	cachedSignalSorted[0].group,
+	"airing_not_caught",
+	"新版在播缓存应在日历和网络刷新完成前保留未追上分组",
+);
+
 process.stdout.write("airing schedule: 全部通过 ✓\n");

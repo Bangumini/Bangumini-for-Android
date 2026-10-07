@@ -4,10 +4,12 @@ import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   cancelAnimation,
   runOnJS,
+  useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
   withSpring,
   withTiming,
+  type SharedValue,
 } from "react-native-reanimated";
 
 type SwipePagerProps = {
@@ -18,17 +20,55 @@ type SwipePagerProps = {
   renderPage: (page: number) => ReactNode;
 };
 
+type PagerSlotProps = {
+  pageNumber: number;
+  pageWidth: SharedValue<number>;
+  positionPage: SharedValue<number>;
+  active: boolean;
+  children: ReactNode;
+};
+
 const MIN_SWIPE_DISTANCE = 56;
 const SWIPE_DISTANCE_RATIO = 0.2;
 const FLING_VELOCITY = 900;
 const TRANSITION_DURATION = 240;
+const PAGE_BUFFER = 2;
 
 function clampPage(page: number, pageCount: number) {
   return Math.min(Math.max(page, 1), pageCount);
 }
 
+function PagerSlot({
+  pageNumber,
+  pageWidth,
+  positionPage,
+  active,
+  children,
+}: PagerSlotProps) {
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: (pageNumber - positionPage.value) * pageWidth.value },
+    ],
+    // 页面过半后让目标页位于上层，避免 React 页码同步前露出旧页内容。
+    zIndex: Math.round(positionPage.value) === pageNumber ? 2 : 1,
+  }));
+
+  return (
+    <Animated.View
+      pointerEvents={active ? "auto" : "none"}
+      style={[
+        styles.page,
+        active ? styles.currentPage : styles.adjacentPage,
+        animatedStyle,
+      ]}
+    >
+      {children}
+    </Animated.View>
+  );
+}
+
 /**
- * 横向平铺翻页容器：拖动时同时移动当前页和相邻页，避免切换数据后再淡入造成断层。
+ * 横向平铺翻页容器：把每次滑动记录成方向意图，再按队列逐页平滑执行。
  */
 export function SwipePager({
   page,
@@ -41,11 +81,17 @@ export function SwipePager({
   const normalizedPage = clampPage(page, safePageCount);
   const [visiblePage, setVisiblePage] = useState(normalizedPage);
 
-  const translateX = useSharedValue(0);
+  // positionPage 是连续页坐标，整数表示停靠页，动画期间允许处于两页之间。
+  const positionPage = useSharedValue(normalizedPage);
+  const gestureStartPosition = useSharedValue(normalizedPage);
+  const currentPage = useSharedValue(normalizedPage);
   const pageWidth = useSharedValue(Math.max(1, width));
-  const visiblePageSV = useSharedValue(normalizedPage);
   const pageCountSV = useSharedValue(safePageCount);
-  const isAnimating = useSharedValue(false);
+  const swipeQueue = useSharedValue<number[]>([]);
+  const isTransitioning = useSharedValue(false);
+  const isReturning = useSharedValue(false);
+  const pagePropRef = useRef(normalizedPage);
+  const internalPageTargetsRef = useRef(new Set<number>());
   const onPageChangeRef = useRef(onPageChange);
 
   useEffect(() => {
@@ -59,141 +105,235 @@ export function SwipePager({
   useEffect(() => {
     pageCountSV.value = safePageCount;
     const nextPage = clampPage(page, safePageCount);
-    visiblePageSV.value = nextPage;
+    const propChanged = nextPage !== pagePropRef.current;
+    const isInternalTarget = internalPageTargetsRef.current.has(nextPage);
+    pagePropRef.current = nextPage;
 
-    if (nextPage === visiblePage) return;
+    if (isInternalTarget) {
+      // 父组件正在回传队列刚提交的页码，不能把正在执行的队列清掉。
+      internalPageTargetsRef.current.delete(nextPage);
+      if (nextPage === visiblePage) currentPage.value = nextPage;
+      return;
+    }
 
-    // 外部切换分组或搜索条件时，立即回到新页，不沿用上一次的拖动位置。
-    cancelAnimation(translateX);
-    translateX.value = 0;
-    isAnimating.value = false;
+    // 内部队列已切到新页，但父组件的受控页码还在下一次 render 才更新。
+    if (!propChanged && nextPage !== visiblePage) return;
+
+    if (nextPage === visiblePage) {
+      if (propChanged) {
+        cancelAnimation(positionPage);
+        positionPage.value = nextPage;
+        gestureStartPosition.value = nextPage;
+        swipeQueue.value = [];
+        isTransitioning.value = false;
+        isReturning.value = false;
+        internalPageTargetsRef.current.clear();
+      }
+      currentPage.value = nextPage;
+      return;
+    }
+
+    internalPageTargetsRef.current.clear();
+
+    // 外部分组、搜索或页码变化时，清空队列并直接定位目标页。
+    cancelAnimation(positionPage);
+    positionPage.value = nextPage;
+    gestureStartPosition.value = nextPage;
+    currentPage.value = nextPage;
+    swipeQueue.value = [];
+    isTransitioning.value = false;
+    isReturning.value = false;
     setVisiblePage(nextPage);
   }, [
-    isAnimating,
+    currentPage,
+    gestureStartPosition,
+    isReturning,
+    isTransitioning,
     page,
     pageCountSV,
+    positionPage,
     safePageCount,
-    translateX,
+    swipeQueue,
     visiblePage,
-    visiblePageSV,
   ]);
 
-  const finishPageChange = (nextPage: number) => {
-    translateX.value = 0;
-    isAnimating.value = false;
-    visiblePageSV.value = nextPage;
+  const announcePage = (nextPage: number) => {
+    internalPageTargetsRef.current.add(nextPage);
     setVisiblePage(nextPage);
     onPageChangeRef.current(nextPage);
+  };
+
+  // 队列变化或上一页动画结束后，由 reaction 取出下一条意图，避免 worklet 自引用。
+  useAnimatedReaction(
+    () => swipeQueue.value.length > 0 && !isTransitioning.value,
+    (shouldStart) => {
+      if (!shouldStart) return;
+
+      const queue = swipeQueue.value.slice();
+      while (queue.length > 0) {
+        const direction = queue.shift() ?? 0;
+        const targetPage = currentPage.value + direction;
+        if (targetPage < 1 || targetPage > pageCountSV.value) continue;
+
+        swipeQueue.value = queue;
+        currentPage.value = targetPage;
+        isTransitioning.value = true;
+        isReturning.value = false;
+        runOnJS(announcePage)(targetPage);
+
+        const distance = Math.max(
+          0.5,
+          Math.abs(targetPage - positionPage.value),
+        );
+        const duration = Math.max(
+          140,
+          Math.min(
+            TRANSITION_DURATION,
+            Math.round(TRANSITION_DURATION * distance),
+          ),
+        );
+        positionPage.value = withTiming(
+          targetPage,
+          { duration },
+          (finished) => {
+            if (!finished) return;
+            positionPage.value = targetPage;
+            isTransitioning.value = false;
+          },
+        );
+        return;
+      }
+
+      swipeQueue.value = queue;
+    },
+  );
+  const enqueueDirection = (direction: number) => {
+    "worklet";
+    if (direction === 0) return;
+
+    // 按“当前动画目标 + 已排队意图”计算虚拟页，提前丢弃越界操作。
+    let plannedPage = currentPage.value;
+    for (const queuedDirection of swipeQueue.value) {
+      plannedPage += queuedDirection;
+    }
+    const queuedTarget = plannedPage + direction;
+    if (queuedTarget < 1 || queuedTarget > pageCountSV.value) return;
+
+    swipeQueue.value = [...swipeQueue.value, direction];
+  };
+
+  const returnToCurrentPage = () => {
+    "worklet";
+    isReturning.value = true;
+    positionPage.value = withSpring(
+      currentPage.value,
+      {
+        damping: 24,
+        stiffness: 260,
+        mass: 0.85,
+      },
+      (finished) => {
+        if (finished) isReturning.value = false;
+      },
+    );
   };
 
   const panGesture = Gesture.Pan()
     .activeOffsetX([-12, 12])
     .failOffsetY([-12, 12])
+    .onStart(() => {
+      // 动画进行中只记录意图，不打断当前轨道；空闲时才让手指直接控制轨道。
+      if (isTransitioning.value) return;
+      cancelAnimation(positionPage);
+      isReturning.value = false;
+      gestureStartPosition.value = positionPage.value;
+    })
     .onUpdate((event) => {
-      if (isAnimating.value) return;
+      if (isTransitioning.value) return;
 
-      const currentPage = visiblePageSV.value;
+      const current = currentPage.value;
       const width = pageWidth.value;
-      const boundedTranslation = Math.max(
-        -width,
-        Math.min(width, event.translationX),
+      const rawPosition =
+        gestureStartPosition.value - event.translationX / width;
+      const minPosition = Math.max(1, current - 1);
+      const maxPosition = Math.min(pageCountSV.value, current + 1);
+      let nextPosition = Math.max(
+        minPosition,
+        Math.min(maxPosition, rawPosition),
       );
-      const atBoundary =
-        (currentPage === 1 && boundedTranslation > 0) ||
-        (currentPage === pageCountSV.value && boundedTranslation < 0);
 
-      // 到达边界时保留一点阻尼，让用户知道这里没有下一页。
-      translateX.value = atBoundary
-        ? boundedTranslation * 0.24
-        : boundedTranslation;
+      if (current === 1 && rawPosition < 1) {
+        nextPosition = 1 + (rawPosition - 1) * 0.24;
+      } else if (
+        current === pageCountSV.value &&
+        rawPosition > pageCountSV.value
+      ) {
+        nextPosition =
+          pageCountSV.value +
+          (rawPosition - pageCountSV.value) * 0.24;
+      }
+
+      positionPage.value = nextPosition;
     })
     .onEnd((event) => {
       "worklet";
-      if (isAnimating.value) return;
-
-      const currentPage = visiblePageSV.value;
       const width = pageWidth.value;
-      const distanceThreshold = Math.max(
+      const threshold = Math.max(
         MIN_SWIPE_DISTANCE,
         width * SWIPE_DISTANCE_RATIO,
       );
-      const shouldGoPrev =
-        event.translationX > 0 &&
-        currentPage > 1 &&
-        (event.translationX > distanceThreshold || event.velocityX > FLING_VELOCITY);
-      const shouldGoNext =
-        event.translationX < 0 &&
-        currentPage < pageCountSV.value &&
-        (event.translationX < -distanceThreshold || event.velocityX < -FLING_VELOCITY);
+      const hasDistance = Math.abs(event.translationX) > threshold;
+      const hasFling = Math.abs(event.velocityX) > FLING_VELOCITY;
+      const direction =
+        event.translationX > 0
+          ? -1
+          : event.translationX < 0
+            ? 1
+            : event.velocityX > 0
+              ? -1
+              : event.velocityX < 0
+                ? 1
+                : 0;
 
-      if (!shouldGoPrev && !shouldGoNext) {
-        translateX.value = withSpring(0, {
-          damping: 24,
-          stiffness: 260,
-          mass: 0.85,
-        });
+      if (!hasDistance && !hasFling) {
+        if (!isTransitioning.value) returnToCurrentPage();
         return;
       }
 
-      const direction = shouldGoPrev ? 1 : -1;
-      const targetPage = shouldGoPrev ? currentPage - 1 : currentPage + 1;
-      isAnimating.value = true;
-      translateX.value = withTiming(
-        direction * width,
-        { duration: TRANSITION_DURATION },
-        (finished) => {
-          if (finished) runOnJS(finishPageChange)(targetPage);
-        },
-      );
+      if (isTransitioning.value) {
+        // 快速连续滑动只入队，当前动画保持匀速完成。
+        enqueueDirection(direction);
+        return;
+      }
+
+      enqueueDirection(direction);
     })
     .onFinalize(() => {
-      if (isAnimating.value) return;
-      translateX.value = withSpring(0, {
-        damping: 24,
-        stiffness: 260,
-        mass: 0.85,
-      });
+      if (isTransitioning.value || isReturning.value) return;
+      returnToCurrentPage();
     });
 
-  const previousPageStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: -pageWidth.value + translateX.value }],
-  }));
-  const currentPageStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translateX.value }],
-  }));
-  const nextPageStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: pageWidth.value + translateX.value }],
-  }));
+  const firstPage = Math.max(1, visiblePage - PAGE_BUFFER);
+  const lastPage = Math.min(safePageCount, visiblePage + PAGE_BUFFER);
+  const pages = [];
+  for (let pageNumber = firstPage; pageNumber <= lastPage; pageNumber += 1) {
+    pages.push(pageNumber);
+  }
 
   return (
     <GestureDetector gesture={panGesture}>
       <View style={styles.viewport}>
-        {visiblePage > 1 ? (
-          <Animated.View
-            key={`page-${visiblePage - 1}`}
-            pointerEvents="none"
-            style={[styles.page, styles.adjacentPage, previousPageStyle]}
+        {pages.map((pageNumber) => (
+          <PagerSlot
+            key={`page-${pageNumber}`}
+            pageNumber={pageNumber}
+            pageWidth={pageWidth}
+            positionPage={positionPage}
+            active={pageNumber === visiblePage}
           >
-            {renderPage(visiblePage - 1)}
-          </Animated.View>
-        ) : null}
-
-        <Animated.View
-          key={`page-${visiblePage}`}
-          style={[styles.page, styles.currentPage, currentPageStyle]}
-        >
-          {renderPage(visiblePage)}
-        </Animated.View>
-
-        {visiblePage < safePageCount ? (
-          <Animated.View
-            key={`page-${visiblePage + 1}`}
-            pointerEvents="none"
-            style={[styles.page, styles.adjacentPage, nextPageStyle]}
-          >
-            {renderPage(visiblePage + 1)}
-          </Animated.View>
-        ) : null}
+            {renderPage(pageNumber)}
+          </PagerSlot>
+        ))}
       </View>
     </GestureDetector>
   );

@@ -1,17 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Linking, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
-import Animated, {
-  runOnJS,
-  useAnimatedStyle,
-  useSharedValue,
-  withSequence,
-  withSpring,
-  withTiming,
-} from "react-native-reanimated";
-
 import { searchAnimeSubject } from "../../shared/api/client";
 import { getNextSeason, getNextSeasonInfo, type NextSeasonItem } from "../../shared/api/anilist";
 import { WEEKDAY_CN } from "../../shared/sort-collections";
@@ -26,6 +16,7 @@ import { SearchInput } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
+import { SwipePager } from "../../src/components/SwipePager";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
@@ -187,54 +178,6 @@ export default function NextSeasonPage() {
   const [page, setPage] = useState(1);
   const seasonInfo = getNextSeasonInfo();
 
-  const translateX = useSharedValue(0);
-  const fadeAnim = useSharedValue(1);
-  const currentPageSV = useSharedValue(1);
-  const totalPagesSV = useSharedValue(1);
-
-  const goToPrevPage = useCallback(() => {
-    setPage((p) => Math.max(1, p - 1));
-  }, []);
-
-  const goToNextPage = useCallback(() => {
-    setPage((p) => p + 1);
-  }, []);
-
-  const panGesture = Gesture.Pan()
-    .activeOffsetX([-10, 10])
-    .failOffsetY([-10, 10])
-    .onUpdate((e) => {
-      translateX.value = e.translationX;
-    })
-    .onEnd((e) => {
-      "worklet";
-      const threshold = 40;
-      if (e.translationX > threshold && currentPageSV.value > 1) {
-        translateX.value = withTiming(0, { duration: 180 });
-        fadeAnim.value = withSequence(
-          withTiming(0, { duration: 80 }),
-          withTiming(1, { duration: 120 }),
-        );
-        currentPageSV.value -= 1;
-        runOnJS(goToPrevPage)();
-      } else if (e.translationX < -threshold && currentPageSV.value < totalPagesSV.value) {
-        translateX.value = withTiming(0, { duration: 180 });
-        fadeAnim.value = withSequence(
-          withTiming(0, { duration: 80 }),
-          withTiming(1, { duration: 120 }),
-        );
-        currentPageSV.value += 1;
-        runOnJS(goToNextPage)();
-      } else {
-        translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
-      }
-    });
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translateX.value }],
-    opacity: fadeAnim.value,
-  }));
-
   const nextSeasonQuery = useQuery({
     queryKey: ["next-season", seasonInfo.seasonYear, seasonInfo.season],
     queryFn: async () => {
@@ -302,13 +245,6 @@ export default function NextSeasonPage() {
   }, [allEntries, segment, searchQuery]);
 
   const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
-  const paged = useMemo(
-    () => items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-    [items, page],
-  );
-
-  useEffect(() => { currentPageSV.value = page; }, [page, currentPageSV]);
-  useEffect(() => { totalPagesSV.value = totalPages; }, [totalPages, totalPagesSV]);
 
   useEffect(() => {
     setPage(1);
@@ -355,52 +291,72 @@ export default function NextSeasonPage() {
           onRetry={() => void nextSeasonQuery.refetch()}
         />
       ) : (
-        <GestureDetector gesture={panGesture}>
-          <Animated.View style={[animatedStyle, { flex: 1 }]}>
-            <FlatList
-              data={paged}
-              keyExtractor={(item) => String(item.id)}
-              contentContainerStyle={paged.length ? styles.list : styles.emptyList}
-              refreshControl={
-                <RefreshControl
-                  refreshing={refreshing}
-                  onRefresh={refresh}
-                  tintColor={colors.primary}
-                  colors={[colors.primary]}
-                />
-              }
-              ListHeaderComponent={
-                <View style={styles.headerRow}>
-                  <Text style={styles.count}>
-                    {currentSegmentLabel} · {items.length}
-                  </Text>
-                  {items.length > 0 && (
-                    <Text style={styles.pageInfo}>
-                      第 {page} / {totalPages} 页 · 共 {items.length} 条
+        <SwipePager
+          page={page}
+          pageCount={totalPages}
+          onPageChange={setPage}
+          renderPage={(pageNumber) => {
+            const pageItems = items.slice(
+              (pageNumber - 1) * PAGE_SIZE,
+              pageNumber * PAGE_SIZE,
+            );
+
+            return (
+              <FlatList
+                data={pageItems}
+                keyExtractor={(item) => String(item.id)}
+                contentContainerStyle={
+                  pageItems.length ? styles.list : styles.emptyList
+                }
+                refreshControl={
+                  <RefreshControl
+                    refreshing={refreshing}
+                    onRefresh={refresh}
+                    tintColor={colors.primary}
+                    colors={[colors.primary]}
+                  />
+                }
+                ListHeaderComponent={
+                  <View style={styles.headerRow}>
+                    <Text style={styles.count}>
+                      {currentSegmentLabel} · {items.length}
                     </Text>
-                  )}
-                </View>
-              }
-              ItemSeparatorComponent={() => <View style={styles.separator} />}
-              ListEmptyComponent={<EmptyState title="没有匹配条目" detail="调整搜索词或切换分组" />}
-              renderItem={({ item }) => (
-                <SubjectCard
-                  title={item.nameCn ?? item.title.native}
-                  subtitle={item.title.romaji}
-                  coverUrl={item.cover?.replace(/^http:/, "https:")}
-                  label={item.weekday ? WEEKDAY_CN[item.weekday].replace("星期", "周") : "TBA"}
-                  meta={[
-                    item.format,
-                    getStartDate(item),
-                    item.airingAt ? formatAiringTime(item.airingAt) : "播出时间未定",
-                  ]}
-                  progress={item.episodes ? `预计 ${item.episodes} 集` : null}
-                  onPress={() => openItem(item)}
-                />
-              )}
-            />
-          </Animated.View>
-        </GestureDetector>
+                    {items.length > 0 && (
+                      <Text style={styles.pageInfo}>
+                        第 {pageNumber} / {totalPages} 页 · 共 {items.length} 条
+                      </Text>
+                    )}
+                  </View>
+                }
+                ItemSeparatorComponent={() => <View style={styles.separator} />}
+                ListEmptyComponent={
+                  <EmptyState title="没有匹配条目" detail="调整搜索词或切换分组" />
+                }
+                renderItem={({ item }) => (
+                  <SubjectCard
+                    title={item.nameCn ?? item.title.native}
+                    subtitle={item.title.romaji}
+                    coverUrl={item.cover?.replace(/^http:/, "https:")}
+                    label={
+                      item.weekday
+                        ? WEEKDAY_CN[item.weekday].replace("星期", "周")
+                        : "TBA"
+                    }
+                    meta={[
+                      item.format,
+                      getStartDate(item),
+                      item.airingAt
+                        ? formatAiringTime(item.airingAt)
+                        : "播出时间未定",
+                    ]}
+                    progress={item.episodes ? `预计 ${item.episodes} 集` : null}
+                    onPress={() => openItem(item)}
+                  />
+                )}
+              />
+            );
+          }}
+        />
       )}
     </View>
   );

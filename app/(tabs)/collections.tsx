@@ -9,15 +9,6 @@ import {
 	Text,
 	View,
 } from "react-native";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
-import Animated, {
-	runOnJS,
-	useAnimatedStyle,
-	useSharedValue,
-	withSequence,
-	withSpring,
-	withTiming,
-} from "react-native-reanimated";
 import * as Clipboard from "expo-clipboard";
 import { router, useFocusEffect } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -100,6 +91,7 @@ import {
 	LoadingState,
 } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
+import { SwipePager } from "../../src/components/SwipePager";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 import { useAlert } from "../../src/components/Dialog";
@@ -553,58 +545,6 @@ export default function CollectionsPage() {
 			return () => setIsPageFocused(false);
 		}, [collectionType, loggedIn, queryClient, syncClock, username]),
 	);
-
-	// --- Pagination: animated swipe between pages ---
-	const translateX = useSharedValue(0);
-	const fadeAnim = useSharedValue(1);
-	const currentPageSV = useSharedValue(1);
-	const totalPagesSV = useSharedValue(1);
-
-	const goToPrevPage = useCallback(() => {
-		setPage((p) => Math.max(1, p - 1));
-	}, []);
-
-	const goToNextPage = useCallback(() => {
-		setPage((p) => p + 1); // clamped by useEffect below
-	}, []);
-
-	const panGesture = Gesture.Pan()
-		.activeOffsetX([-10, 10])
-		.failOffsetY([-10, 10])
-		.onUpdate((e) => {
-			translateX.value = e.translationX;
-		})
-		.onEnd((e) => {
-			"worklet";
-			const threshold = 40;
-			if (e.translationX > threshold && currentPageSV.value > 1) {
-				translateX.value = withTiming(0, { duration: 180 });
-				fadeAnim.value = withSequence(
-					withTiming(0, { duration: 80 }),
-					withTiming(1, { duration: 120 }),
-				);
-				currentPageSV.value -= 1;
-				runOnJS(goToPrevPage)();
-			} else if (
-				e.translationX < -threshold &&
-				currentPageSV.value < totalPagesSV.value
-			) {
-				translateX.value = withTiming(0, { duration: 180 });
-				fadeAnim.value = withSequence(
-					withTiming(0, { duration: 80 }),
-					withTiming(1, { duration: 120 }),
-				);
-				currentPageSV.value += 1;
-				runOnJS(goToNextPage)();
-			} else {
-				translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
-			}
-		});
-
-	const animatedStyle = useAnimatedStyle(() => ({
-		transform: [{ translateX: translateX.value }],
-		opacity: fadeAnim.value,
-	}));
 
 	useEffect(() => {
 		if (!checking && !loggedIn) router.replace("/login");
@@ -1427,10 +1367,6 @@ export default function CollectionsPage() {
 
 	// --- Pagination ---
 	const totalPages = Math.max(1, Math.ceil(collections.length / PAGE_SIZE));
-	const paged = useMemo(
-		() => collections.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-		[collections, page],
-	);
 
 	// --- Grouped sections for the watching tab ---
 	// 组计数取全量（搜索过滤后）而非本页，翻页时组头信息保持稳定
@@ -1442,37 +1378,36 @@ export default function CollectionsPage() {
 		return map;
 	}, [collections]);
 
-	const sections = useMemo<CollectionSection[]>(() => {
-		// 非在看 tab：单 section 平铺，不渲染组头
-		if (!isWatching) {
-			return [{ data: paged }];
-		}
-		const result: CollectionSection[] = [];
-		for (const item of paged) {
-			const last = result[result.length - 1];
-			if (last && last.group === item.group) {
-				last.data.push(item);
-			} else {
-				// 每页首个 section 无条件带组头：跨页延续的组在后续页也能看到组名
-				result.push({
-					group: item.group,
-					title: GROUP_LABEL[item.group],
-					color: GROUP_COLOR[item.group],
-					count: groupCounts.get(item.group) ?? 0,
-					data: [item],
-				});
+	const getSectionsForPage = useCallback(
+		(pageNumber: number): CollectionSection[] => {
+			const pageItems = collections.slice(
+				(pageNumber - 1) * PAGE_SIZE,
+				pageNumber * PAGE_SIZE,
+			);
+			// 非在看 tab：单 section 平铺，不渲染组头
+			if (!isWatching) {
+				return [{ data: pageItems }];
 			}
-		}
-		return result;
-	}, [paged, isWatching, groupCounts]);
-
-	// Keep shared values in sync for worklet access
-	useEffect(() => {
-		currentPageSV.value = page;
-	}, [page, currentPageSV]);
-	useEffect(() => {
-		totalPagesSV.value = totalPages;
-	}, [totalPages, totalPagesSV]);
+			const result: CollectionSection[] = [];
+			for (const item of pageItems) {
+				const last = result[result.length - 1];
+				if (last && last.group === item.group) {
+					last.data.push(item);
+				} else {
+					// 每页首个 section 无条件带组头：跨页延续的组在后续页也能看到组名
+					result.push({
+						group: item.group,
+						title: GROUP_LABEL[item.group],
+						color: GROUP_COLOR[item.group],
+						count: groupCounts.get(item.group) ?? 0,
+						data: [item],
+					});
+				}
+			}
+			return result;
+		},
+		[collections, groupCounts, isWatching],
+	);
 
 	// Reset page when collection type or search changes
 	useEffect(() => {
@@ -1572,15 +1507,6 @@ export default function CollectionsPage() {
 		!activeCommittedState &&
 		!canCommitCacheSnapshot &&
 		(isDisplayDependencyError || (collectionsQuery.isError && !collectionsQuery.data));
-	const listContentStyle = [
-		paged.length ? styles.list : styles.emptyList,
-		collectionTask
-			? taskPanelExpanded
-				? styles.listWithExpandedTaskDock
-				: styles.listWithTaskDock
-			: null,
-	];
-
 	if (checking) return <LoadingState label="检查登录状态" />;
 	if (!loggedIn) return <LoadingState label="跳转登录" />;
 
@@ -1609,13 +1535,30 @@ export default function CollectionsPage() {
 					onRetry={() => void refresh()}
 				/>
 			) : (
-				<GestureDetector gesture={panGesture}>
-					<Animated.View style={[animatedStyle, { flex: 1 }]}>
-						<SectionList
-							sections={sections}
-							keyExtractor={(item) => String(item.collection.subject_id)}
-							contentContainerStyle={listContentStyle}
-							refreshControl={
+				<SwipePager
+					page={page}
+					pageCount={totalPages}
+					onPageChange={setPage}
+					renderPage={(pageNumber) => {
+						const pageItems = collections.slice(
+							(pageNumber - 1) * PAGE_SIZE,
+							pageNumber * PAGE_SIZE,
+						);
+						const pageListContentStyle = [
+							pageItems.length ? styles.list : styles.emptyList,
+							collectionTask
+								? taskPanelExpanded
+									? styles.listWithExpandedTaskDock
+									: styles.listWithTaskDock
+								: null,
+						];
+
+						return (
+							<SectionList
+								sections={getSectionsForPage(pageNumber)}
+								keyExtractor={(item) => String(item.collection.subject_id)}
+								contentContainerStyle={pageListContentStyle}
+								refreshControl={
 								<RefreshControl
 									refreshing={refreshing}
 									onRefresh={refresh}
@@ -1633,7 +1576,7 @@ export default function CollectionsPage() {
 									</Text>
 									{collections.length > 0 && (
 										<Text style={styles.pageInfo}>
-											第 {page} / {totalPages} 页 · 共 {collections.length} 条
+											第 {pageNumber} / {totalPages} 页 · 共 {collections.length} 条
 										</Text>
 									)}
 								</View>
@@ -1692,8 +1635,9 @@ export default function CollectionsPage() {
 								);
 							}}
 						/>
-					</Animated.View>
-				</GestureDetector>
+						);
+					}}
+				/>
 			)}
 
 			{collectionTask ? (

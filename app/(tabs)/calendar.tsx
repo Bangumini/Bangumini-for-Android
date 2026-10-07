@@ -9,16 +9,6 @@ import {
 } from "react-native";
 import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
-import Animated, {
-  runOnJS,
-  useAnimatedStyle,
-  useSharedValue,
-  withSequence,
-  withSpring,
-  withTiming,
-} from "react-native-reanimated";
-
 import { getCalendar } from "../../shared/api/client";
 import type { CalendarItem, SubjectSmall } from "../../shared/api/types";
 import {
@@ -41,11 +31,11 @@ import {
   LoadingState,
 } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
+import { SwipePager } from "../../src/components/SwipePager";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
-const FIRST_WEEKDAY = 1;
 const LAST_WEEKDAY = 7;
 const WEEKDAY_VALUES = [1, 2, 3, 4, 5, 6, 7];
 
@@ -100,59 +90,6 @@ export default function CalendarPage() {
   );
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-
-  const translateX = useSharedValue(0);
-  const fadeAnim = useSharedValue(1);
-  const currentWeekdaySV = useSharedValue(weekday);
-
-  const goToPrevWeekday = () => {
-    setWeekday((current) => Math.max(FIRST_WEEKDAY, current - 1));
-  };
-
-  const goToNextWeekday = () => {
-    setWeekday((current) => Math.min(LAST_WEEKDAY, current + 1));
-  };
-
-  const panGesture = Gesture.Pan()
-    .activeOffsetX([-10, 10])
-    .failOffsetY([-10, 10])
-    .onUpdate((e) => {
-      translateX.value = e.translationX;
-    })
-    .onEnd((e) => {
-      "worklet";
-      const threshold = 40;
-      if (
-        e.translationX > threshold &&
-        currentWeekdaySV.value > FIRST_WEEKDAY
-      ) {
-        translateX.value = withTiming(0, { duration: 180 });
-        fadeAnim.value = withSequence(
-          withTiming(0, { duration: 80 }),
-          withTiming(1, { duration: 120 }),
-        );
-        currentWeekdaySV.value -= 1;
-        runOnJS(goToPrevWeekday)();
-      } else if (
-        e.translationX < -threshold &&
-        currentWeekdaySV.value < LAST_WEEKDAY
-      ) {
-        translateX.value = withTiming(0, { duration: 180 });
-        fadeAnim.value = withSequence(
-          withTiming(0, { duration: 80 }),
-          withTiming(1, { duration: 120 }),
-        );
-        currentWeekdaySV.value += 1;
-        runOnJS(goToNextWeekday)();
-      } else {
-        translateX.value = withSpring(0, { damping: 20, stiffness: 300 });
-      }
-    });
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translateX.value }],
-    opacity: fadeAnim.value,
-  }));
 
   const calendarQuery = useQuery({
     queryKey: ["calendar"],
@@ -222,17 +159,6 @@ export default function CalendarPage() {
         data,
       }));
   }, [searchedItems, isSearching]);
-
-  const day = useMemo(
-    () => calendarQuery.data?.find((item) => item.weekday.id === weekday),
-    [calendarQuery.data, weekday],
-  );
-
-  const dayItems = day?.items ?? [];
-
-  useEffect(() => {
-    currentWeekdaySV.value = weekday;
-  }, [weekday, currentWeekdaySV]);
 
   async function refresh() {
     setRefreshing(true);
@@ -314,35 +240,45 @@ export default function CalendarPage() {
           stickySectionHeadersEnabled={false}
         />
       ) : (
-        <GestureDetector gesture={panGesture}>
-          <Animated.View style={[animatedStyle, { flex: 1 }]}>
-            <FlatList
-              data={dayItems}
-              keyExtractor={(item) => String(item.id)}
-              contentContainerStyle={
-                dayItems.length ? styles.list : styles.emptyList
-              }
-              refreshControl={
-                <RefreshControl
-                  refreshing={refreshing}
-                  onRefresh={refresh}
-                  tintColor={colors.primary}
-                  colors={[colors.primary]}
-                />
-              }
-              ListHeaderComponent={
-                dayItems.length > 0 ? (
-                  <View style={styles.headerRow}>
-                    <Text style={styles.count}>共 {dayItems.length} 条</Text>
-                  </View>
-                ) : null
-              }
-              ItemSeparatorComponent={() => <View style={styles.separator} />}
-              ListEmptyComponent={<EmptyState title="当天没有放送条目" />}
-              renderItem={renderItem}
-            />
-          </Animated.View>
-        </GestureDetector>
+        <SwipePager
+          page={weekday}
+          pageCount={LAST_WEEKDAY}
+          onPageChange={setWeekday}
+          renderPage={(pageValue) => {
+            const pageDay = calendarQuery.data?.find(
+              (item) => item.weekday.id === pageValue,
+            );
+            const pageItems = pageDay?.items ?? [];
+
+            return (
+              <FlatList
+                data={pageItems}
+                keyExtractor={(item) => String(item.id)}
+                contentContainerStyle={
+                  pageItems.length ? styles.list : styles.emptyList
+                }
+                refreshControl={
+                  <RefreshControl
+                    refreshing={refreshing}
+                    onRefresh={refresh}
+                    tintColor={colors.primary}
+                    colors={[colors.primary]}
+                  />
+                }
+                ListHeaderComponent={
+                  pageItems.length > 0 ? (
+                    <View style={styles.headerRow}>
+                      <Text style={styles.count}>共 {pageItems.length} 条</Text>
+                    </View>
+                  ) : null
+                }
+                ItemSeparatorComponent={() => <View style={styles.separator} />}
+                ListEmptyComponent={<EmptyState title="当天没有放送条目" />}
+                renderItem={renderItem}
+              />
+            );
+          }}
+        />
       )}
     </View>
   );

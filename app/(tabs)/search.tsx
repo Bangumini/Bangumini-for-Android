@@ -12,7 +12,7 @@ import {
   writeCachedSubjectPreviews,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
-import { SearchInput } from "../../src/components/SearchInput";
+import { useHeaderSearch } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
@@ -60,6 +60,12 @@ export default function SearchPage() {
   const [type, setType] = useState(2);
   const debouncedKeyword = useDebouncedValue(keyword.trim(), 300);
 
+  useHeaderSearch({
+    value: keyword,
+    onChangeText: setKeyword,
+    placeholder: "搜索条目",
+  });
+
   const searchQuery = useQuery({
     queryKey: ["search", debouncedKeyword, type],
     enabled: debouncedKeyword.length > 0,
@@ -70,7 +76,6 @@ export default function SearchPage() {
 
   return (
     <View style={styles.screen}>
-      <SearchInput value={keyword} onChangeText={setKeyword} placeholder="搜索条目" />
       <SegmentedControl options={TYPE_OPTIONS} value={type} onChange={setType} />
 
       {!debouncedKeyword ? (

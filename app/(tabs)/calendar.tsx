@@ -23,7 +23,7 @@ import {
   writeCachedSubjectPreviews,
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
-import { SearchInput } from "../../src/components/SearchInput";
+import { useHeaderSearch } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import {
   EmptyState,
@@ -90,6 +90,12 @@ export default function CalendarPage() {
   );
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+
+  useHeaderSearch({
+    value: search,
+    onChangeText: setSearch,
+    placeholder: "搜索本周放送",
+  });
 
   const calendarQuery = useQuery({
     queryKey: ["calendar"],
@@ -195,12 +201,6 @@ export default function CalendarPage() {
         value={weekday}
         onChange={setWeekday}
       />
-      <SearchInput
-        value={search}
-        onChangeText={setSearch}
-        placeholder="搜索本周放送"
-      />
-
       {calendarQuery.isLoading ? (
         <LoadingState label="加载日历" />
       ) : calendarQuery.isError && !calendarQuery.data ? (

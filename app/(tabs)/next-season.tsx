@@ -12,7 +12,7 @@ import {
   writeCachedValue,
 } from "../../shared/storage/sqlite-cache";
 import { formatAiringTime } from "../../src/utils/date";
-import { SearchInput } from "../../src/components/SearchInput";
+import { useHeaderSearch } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import { EmptyState, ErrorState, LoadingState } from "../../src/components/ScreenState";
 import { SubjectCard } from "../../src/components/SubjectCard";
@@ -177,6 +177,13 @@ export default function NextSeasonPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
   const seasonInfo = getNextSeasonInfo();
+  const currentSegmentLabel = SEGMENTS.find((s) => s.value === segment)?.label ?? "全部";
+
+  useHeaderSearch({
+    value: search,
+    onChangeText: setSearch,
+    placeholder: `搜索${currentSegmentLabel}`,
+  });
 
   const nextSeasonQuery = useQuery({
     queryKey: ["next-season", seasonInfo.seasonYear, seasonInfo.season],
@@ -275,13 +282,10 @@ export default function NextSeasonPage() {
     }
   }
 
-  const currentSegmentLabel = SEGMENTS.find((s) => s.value === segment)?.label ?? "全部";
-
   return (
     <View style={styles.screen}>
       <Text style={styles.heading}>{seasonInfo.label}</Text>
       <SegmentedControl options={SEGMENTS} value={segment} onChange={setSegment} />
-      <SearchInput value={search} onChangeText={setSearch} placeholder={`搜索${currentSegmentLabel}`} />
 
       {nextSeasonQuery.isLoading ? (
         <LoadingState label="加载下季度新番" />

@@ -83,7 +83,7 @@ import {
 	subscribeCollectionTaskQueue,
 	type CollectionTask,
 } from "../../src/api/collection-tasks";
-import { SearchInput } from "../../src/components/SearchInput";
+import { useHeaderSearch } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import {
 	EmptyState,
@@ -476,6 +476,12 @@ export default function CollectionsPage() {
 	const [collectionType, setCollectionType] = useState<CollectionType>(3);
 	const [search, setSearch] = useState("");
 	const [refreshing, setRefreshing] = useState(false);
+
+	useHeaderSearch({
+		value: search,
+		onChangeText: setSearch,
+		placeholder: `搜索${CollectionTypeLabel[collectionType]}`,
+	});
 	const [page, setPage] = useState(1);
 	const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
 	const [taskPanelExpanded, setTaskPanelExpanded] = useState(false);
@@ -1517,12 +1523,6 @@ export default function CollectionsPage() {
 				value={collectionType}
 				onChange={setCollectionType}
 			/>
-			<SearchInput
-				value={search}
-				onChangeText={setSearch}
-				placeholder={`搜索${CollectionTypeLabel[collectionType]}`}
-			/>
-
 			{isDisplayLoading ? (
 				<LoadingState label="加载收藏" />
 			) : isDisplayError ? (

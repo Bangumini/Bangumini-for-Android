@@ -55,6 +55,7 @@ export type CachedValueEntry<T> = {
   payload: T;
   updatedAt: number;
   accessedAt: number;
+  isStale: boolean;
 };
 
 export type CachedImageRecord = {
@@ -312,8 +313,9 @@ function getAccessedAt(row: { updated_at: number; accessed_at?: number | null })
   return row.accessed_at ?? row.updated_at;
 }
 
-function isFresh(row: { updated_at: number; accessed_at?: number | null }, now = Date.now()) {
-  return now - getAccessedAt(row) <= CACHE_TTL_MS;
+function isFresh(row: { updated_at: number }, now = Date.now()) {
+  // 数据新鲜度由内容更新时间决定，访问时间只用于清理长期未使用的缓存。
+  return now - row.updated_at <= CACHE_TTL_MS;
 }
 
 function isUpdatedWithin(row: { updated_at: number }, maxAgeMs: number, now = Date.now()) {
@@ -612,6 +614,31 @@ export async function readCachedCollectionWithin(
   }, null);
 }
 
+/** 读取用户所有已缓存的收藏条目，作为聚合收藏缓存缺失时的首屏兜底。 */
+export async function readAllCachedCollections(
+  username: string,
+): Promise<UserCollection[]> {
+  if (!username) return [];
+  return withDatabase(async (db) => {
+    const rows = await db.select<Array<{ payload_json: string }>>(
+      "SELECT payload_json FROM subject_collections WHERE username = $1",
+      [username],
+    );
+    const collections: UserCollection[] = [];
+    for (const row of rows) {
+      try {
+        const collection = JSON.parse(row.payload_json) as UserCollection;
+        if (collection && typeof collection.subject_id === "number") {
+          collections.push(collection);
+        }
+      } catch {
+        // 忽略损坏的缓存条目。
+      }
+    }
+    return collections;
+  }, []);
+}
+
 export async function writeCachedCollection(username: string, collection: UserCollection | null) {
   if (!username || !collection) return;
   await withDatabase(async (db) => {
@@ -709,8 +736,9 @@ export async function readCachedValue<T>(cacheKey: string): Promise<T | null> {
   }, null);
 }
 
-export async function readCachedValueEntry<T>(
+async function readCachedValueEntryInternal<T>(
   cacheKey: string,
+  allowStale: boolean,
 ): Promise<CachedValueEntry<T> | null> {
   return withDatabase(async (db) => {
     const rows = await db.select<TimedPayloadRow[]>(
@@ -718,7 +746,7 @@ export async function readCachedValueEntry<T>(
       [cacheKey],
     );
     const row = rows[0];
-    if (!row || !isFresh(row)) return null;
+    if (!row || (!allowStale && !isFresh(row))) return null;
 
     const payload = parsePayload<T>(rows);
     if (payload === null) return null;
@@ -728,8 +756,22 @@ export async function readCachedValueEntry<T>(
       payload,
       updatedAt: row.updated_at,
       accessedAt: getAccessedAt(row),
+      isStale: !isFresh(row),
     };
   }, null);
+}
+
+export function readCachedValueEntry<T>(
+  cacheKey: string,
+): Promise<CachedValueEntry<T> | null> {
+  return readCachedValueEntryInternal(cacheKey, false);
+}
+
+/** 读取可用的本地快照，即使它已经过期，也交给调用方后台刷新。 */
+export function readCachedValueEntryAllowStale<T>(
+  cacheKey: string,
+): Promise<CachedValueEntry<T> | null> {
+  return readCachedValueEntryInternal(cacheKey, true);
 }
 
 export async function readCachedValueWithin<T>(
@@ -787,7 +829,10 @@ export async function readCachedValuesWithin<T>(
   }, new Map());
 }
 
-export async function readCachedValues<T>(cacheKeys: string[]): Promise<Map<string, T>> {
+async function readCachedValuesInternal<T>(
+  cacheKeys: string[],
+  allowStale: boolean,
+): Promise<Map<string, T>> {
   const uniqueKeys = [...new Set(cacheKeys)].filter(Boolean);
   if (uniqueKeys.length === 0) return new Map();
 
@@ -805,7 +850,7 @@ export async function readCachedValues<T>(cacheKeys: string[]): Promise<Map<stri
     const touchedKeys: string[] = [];
 
     for (const row of rows) {
-      if (!isFresh(row, now)) continue;
+      if (!allowStale && !isFresh(row, now)) continue;
       const payload = parsePayload<T>([row]);
       if (payload === null) continue;
       result.set(row.cache_key, payload);
@@ -822,6 +867,19 @@ export async function readCachedValues<T>(cacheKeys: string[]): Promise<Map<stri
 
     return result;
   }, new Map());
+}
+
+export function readCachedValues<T>(
+  cacheKeys: string[],
+): Promise<Map<string, T>> {
+  return readCachedValuesInternal(cacheKeys, false);
+}
+
+/** 批量读取本地快照，即使过期也返回，由调用方在后台刷新。 */
+export function readCachedValuesAllowStale<T>(
+  cacheKeys: string[],
+): Promise<Map<string, T>> {
+  return readCachedValuesInternal(cacheKeys, true);
 }
 
 export async function readCachedValueWithLegacy<T>(

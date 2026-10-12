@@ -4,6 +4,7 @@ import {
 	AIRING_NEGATIVE_CACHE_MAX_AGE,
 	AIRING_RECORD_MAX_AGE,
 	applyAiringLookupResult,
+	isAiringRecordDisplayable,
 	isAiringRecordUsable,
 	shouldRefreshAiringRecord,
 } from "../shared/airing-cache.ts";
@@ -28,6 +29,20 @@ const staleTemplate = {
 	fetchedAt: now - AIRING_RECORD_MAX_AGE + 1,
 };
 assert.equal(isAiringRecordUsable(staleTemplate, now), true);
+const expiredTemplate = {
+	...future,
+	fetchedAt: now - AIRING_RECORD_MAX_AGE - 1,
+};
+assert.equal(
+	isAiringRecordDisplayable(expiredTemplate),
+	true,
+	"过期的排期缓存仍应先用于首屏分组，刷新由后台请求负责",
+);
+assert.equal(
+	shouldRefreshAiringRecord(expiredTemplate, now),
+	true,
+	"用于首屏的过期排期缓存仍必须触发后台刷新",
+);
 assert.equal(
 	applyAiringLookupResult(
 		staleTemplate,

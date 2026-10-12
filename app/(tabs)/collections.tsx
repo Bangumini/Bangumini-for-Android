@@ -33,7 +33,7 @@ import { buildSubjectKeywords } from "../../shared/pinyin-keywords";
 import {
 	applyAiringLookupResult,
 	isAiringCacheRecord,
-	isAiringRecordUsable,
+	isAiringRecordDisplayable,
 	shouldRefreshAiringRecord,
 	toAiringObservation,
 	type AiringCacheRecord,
@@ -63,10 +63,11 @@ import {
 	deleteCachedValue,
 	deleteCachedValuesByPrefix,
 	getPreferredSubjectCoverUrl,
+	readAllCachedCollections,
 	readCachedCollection,
 	readCachedSubject,
-	readCachedValueEntry,
-	readCachedValues,
+	readCachedValueEntryAllowStale,
+	readCachedValuesAllowStale,
 	writeCachedCollection,
 	writeCachedSubject,
 	writeCachedSubjectPreviews,
@@ -96,6 +97,7 @@ import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 import { useAlert } from "../../src/components/Dialog";
 import { refreshQueryDataIfChanged } from "../../src/api/stale-cache-refresh";
+import { canRenderCachedCollectionsSnapshot } from "../../shared/collection-display";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const AIRING_CACHE_PREFIX = "anilist-airing-v2-";
@@ -127,6 +129,7 @@ type CachedSnapshot<T> = {
 
 type CommittedCollectionsState = {
 	scopeKey: string;
+	source: "cache" | "network";
 	version: string;
 	sorted: SortedCollection[];
 	displayLabelMap: Map<number, string | null>;
@@ -153,8 +156,7 @@ const COLLECTION_OPTIONS: { value: CollectionType; label: string }[] = [
 async function readCachedAiringRecords(subjectIds: number[]) {
 	const uniqueIds = [...new Set(subjectIds)];
 	const keys = uniqueIds.map((id) => `${AIRING_CACHE_PREFIX}${id}`);
-	const cachedByKey = await readCachedValues<unknown>(keys);
-	const nowMs = Date.now();
+	const cachedByKey = await readCachedValuesAllowStale<unknown>(keys);
 	const map = new Map<number, AiringCacheRecord>();
 	const invalidKeys: string[] = [];
 	for (const id of uniqueIds) {
@@ -164,7 +166,7 @@ async function readCachedAiringRecords(subjectIds: number[]) {
 			invalidKeys.push(key);
 			continue;
 		}
-		if (isAiringCacheRecord(value) && isAiringRecordUsable(value, nowMs)) {
+		if (isAiringRecordDisplayable(value)) {
 			map.set(id, value);
 		}
 	}
@@ -325,22 +327,34 @@ async function readCachedCollections(
 	username: string,
 ): Promise<{ payload: PagedResponse<UserCollection>; updatedAt: number } | null> {
 	const cacheKey = `collections-${type}-${username}`;
-	const cached = await readCachedValueEntry<unknown>(cacheKey);
-	if (!cached) return null;
-	if (!isPagedCollectionCache(cached.payload)) {
-		await deleteCachedValue(cacheKey);
-		return null;
+	const cached = await readCachedValueEntryAllowStale<unknown>(cacheKey);
+	if (cached && isPagedCollectionCache(cached.payload)) {
+		await mergeSubjectCollections(cached.payload, username);
+		cached.payload.data = cached.payload.data.filter((c) => c.type === type);
+		return { payload: cached.payload, updatedAt: cached.updatedAt };
 	}
-	await mergeSubjectCollections(cached.payload, username);
-	cached.payload.data = cached.payload.data.filter((c) => c.type === type);
-	return { payload: cached.payload, updatedAt: cached.updatedAt };
+	if (cached) await deleteCachedValue(cacheKey);
+
+	const itemCollections = (await readAllCachedCollections(username)).filter(
+		(collection) => collection.type === type,
+	);
+	if (itemCollections.length === 0) return null;
+	return {
+		payload: {
+			data: itemCollections,
+			total: itemCollections.length,
+			limit: itemCollections.length,
+			offset: 0,
+		},
+		updatedAt: 0,
+	};
 }
 
 async function readCachedCalendar(): Promise<{
 	payload: CalendarItem[];
 	updatedAt: number;
 } | null> {
-	const cached = await readCachedValueEntry<unknown>("calendar");
+	const cached = await readCachedValueEntryAllowStale<unknown>("calendar");
 	if (!cached) return null;
 	if (!isCalendarCache(cached.payload)) {
 		await deleteCachedValue("calendar");
@@ -435,6 +449,25 @@ function getTaskPriority(task: CollectionTask) {
 	if (task.status === "failed") return 0;
 	if (task.status === "running") return 1;
 	return 2;
+}
+
+function hasLocalCollectionChanges(
+	liveData: PagedResponse<UserCollection>,
+	originalData: PagedResponse<UserCollection>,
+) {
+	const liveBySubjectId = new Map(
+		liveData.data.map((collection) => [collection.subject_id, collection]),
+	);
+	if (liveBySubjectId.size !== originalData.data.length) return true;
+
+	for (const original of originalData.data) {
+		const live = liveBySubjectId.get(original.subject_id);
+		if (!live) return true;
+		if (live.type !== original.type || live.ep_status !== original.ep_status) {
+			return true;
+		}
+	}
+	return false;
 }
 
 function enrichCollections(
@@ -604,6 +637,7 @@ export default function CollectionsPage() {
 					refreshKey: collectionsCacheKey,
 					currentData: cached.payload,
 					refresh: () => loadCollections(collectionType, username, true),
+					hasLocalChanges: hasLocalCollectionChanges,
 				});
 				trackBackgroundRefresh(refreshTask);
 				return cached.payload;
@@ -874,7 +908,7 @@ export default function CollectionsPage() {
 			const map = new Map<number, AiringCacheRecord>(persistedRecords);
 			for (const [subjectId, record] of cachedAiringRecordMap ??
 				EMPTY_AIRING_RECORD_MAP) {
-				if (!map.has(subjectId) && isAiringRecordUsable(record, Date.now())) {
+				if (!map.has(subjectId) && isAiringRecordDisplayable(record)) {
 					map.set(subjectId, record);
 				}
 			}
@@ -943,7 +977,7 @@ export default function CollectionsPage() {
 			const cachedRecords = new Map<number, EpisodeScheduleCache>();
 			const idsToFetch: number[] = [];
 			const invalidCacheKeys: string[] = [];
-			const cachedByKey = await readCachedValues<unknown>(
+			const cachedByKey = await readCachedValuesAllowStale<unknown>(
 				allEpisodeIds.map(getEpisodeCacheKey),
 			);
 			const checkedAt = Date.now();
@@ -1117,11 +1151,13 @@ export default function CollectionsPage() {
 	}, [sortedCollections, nowMs, nextAiringAtMap]);
 
 	// --- Local v2 cache snapshot ---
-	const cacheCollectionsData =
+	const hasCollectionsSnapshot =
 		cachedCollectionsSnapshot.key === collectionsCacheKey &&
-		cachedCollectionsSnapshot.complete
-			? cachedCollectionsSnapshot.value
-			: null;
+		cachedCollectionsSnapshot.complete &&
+		cachedCollectionsSnapshot.value !== null;
+	const cacheCollectionsData = hasCollectionsSnapshot
+		? cachedCollectionsSnapshot.value
+		: collectionsQuery.data ?? null;
 	const cacheRawCollections = useMemo(() => {
 		const source = cacheCollectionsData?.data ?? EMPTY_COLLECTIONS;
 		return source
@@ -1134,43 +1170,22 @@ export default function CollectionsPage() {
 			})
 			.filter((collection) => collection.type === collectionType);
 	}, [cacheCollectionsData, collectionType, visibleCollectionTasks]);
-	const cacheCalendar = useMemo(
-		() =>
+	const cacheCalendar = useMemo(() => {
+		if (
 			cachedCalendarSnapshot.key === "calendar" &&
 			cachedCalendarSnapshot.complete
-				? (cachedCalendarSnapshot.value ?? [])
-				: [],
-		[cachedCalendarSnapshot],
-	);
-	const cacheAiringMap = useMemo(() => getAiringMap(cacheCalendar), [cacheCalendar]);
-	const cacheAiringObservationMap = useMemo(() => {
-		const map = new Map<number, AiringObservation>();
-		for (const [subjectId, record] of cachedAiringRecordMap ?? EMPTY_AIRING_RECORD_MAP) {
-			const observation = toAiringObservation(record);
-			if (observation) map.set(subjectId, observation);
+		) {
+			return cachedCalendarSnapshot.value ?? [];
 		}
-		return map;
-	}, [cachedAiringRecordMap]);
+		return calendarQuery.data ?? [];
+	}, [cachedCalendarSnapshot, calendarQuery.data]);
+	const cacheAiringMap = useMemo(() => getAiringMap(cacheCalendar), [cacheCalendar]);
+	const cacheAiringObservationMap = airingObservationMap;
 	const cacheEpisodeListMap =
 		cachedEpisodeSnapshot.key === episodeQuerySourceKey &&
 		cachedEpisodeSnapshot.value
 			? cachedEpisodeSnapshot.value
-			: EMPTY_EPISODE_LIST_MAP;
-	const cacheAiringMetadataIds = useMemo(
-		() =>
-			isWatching
-				? cacheRawCollections
-						.filter((item) => {
-							const total = item.subject.eps || item.subject.total_episodes || 0;
-							return (
-								(total === 0 || item.ep_status < total) &&
-								!cacheAiringMap.has(item.subject_id)
-							);
-						})
-						.map((item) => item.subject_id)
-				: [],
-		[cacheRawCollections, cacheAiringMap, isWatching],
-	);
+			: episodeListMapData ?? EMPTY_EPISODE_LIST_MAP;
 	const cacheDerivedAiringData = useMemo(
 		() =>
 			deriveAiringMaps(
@@ -1233,29 +1248,12 @@ export default function CollectionsPage() {
 		cacheDerivedAiringData.nextAiringAtMap,
 	]);
 
-	const hasCachedCollections =
-		cachedCollectionsSnapshot.key === collectionsCacheKey &&
-		cachedCollectionsSnapshot.complete &&
-		cachedCollectionsSnapshot.value !== null;
-	const hasCachedAiringMetadata =
-		!isWatching ||
-		cacheAiringMetadataIds.length === 0 ||
-		(cachedAiringTimeFetched &&
-			cachedAiringRecordMap !== undefined &&
-			cacheAiringMetadataIds.every((subjectId) =>
-				cachedAiringRecordMap.has(subjectId),
-			));
+	const hasCachedCollections = hasCollectionsSnapshot || collectionsQuery.data !== undefined;
 	const shouldLoadEpisodes = isWatching && allEpisodeIds.length > 0;
-	const hasCachedEpisodes =
-		!shouldLoadEpisodes ||
-		(cachedEpisodeSnapshot.key === episodeQuerySourceKey &&
-			cachedEpisodeSnapshot.complete &&
-			cachedEpisodeSnapshot.value !== null);
-	const canCommitCacheSnapshot =
-		Boolean(username) &&
-		hasCachedCollections &&
-		hasCachedAiringMetadata &&
-		hasCachedEpisodes;
+	const canCommitCacheSnapshot = canRenderCachedCollectionsSnapshot({
+		username,
+		hasCachedCollections,
+	});
 
 	const isDisplayDependencyError =
 		(!collectionsQuery.data && collectionsQuery.isError) ||
@@ -1324,8 +1322,12 @@ export default function CollectionsPage() {
 			: cacheJustUpdatedSubjectIds;
 
 		setCommittedState((previous) => {
-			// 网络刷新期间保留当前已经提交的快照，避免闪回到不完整数据。
-			if (!useSettledData && previous?.scopeKey === committedScopeKey) {
+			// 网络刷新期间保留已经提交的新鲜快照，避免闪回到不完整缓存。
+			if (
+				!useSettledData &&
+				previous?.scopeKey === committedScopeKey &&
+				previous.source === "network"
+			) {
 				return previous;
 			}
 			if (
@@ -1336,6 +1338,7 @@ export default function CollectionsPage() {
 			}
 			return {
 				scopeKey: committedScopeKey,
+				source: useSettledData ? "network" : "cache",
 				version: nextVersion,
 				sorted: nextSorted,
 				displayLabelMap: nextDisplayLabelMap,
@@ -1357,8 +1360,23 @@ export default function CollectionsPage() {
 		username,
 	]);
 
-	const activeCommittedState =
+	const localFallbackState: CommittedCollectionsState | null =
+		canCommitCacheSnapshot
+			? {
+					scopeKey: committedScopeKey,
+					source: "cache",
+					version: cacheCommittedVersion,
+					sorted: cacheSortedCollections,
+					displayLabelMap: cacheDisplayLabelMap,
+					justUpdatedSubjectIds: cacheJustUpdatedSubjectIds,
+				}
+			: null;
+	const committedForScope =
 		committedState?.scopeKey === committedScopeKey ? committedState : null;
+	const activeCommittedState =
+		committedForScope?.source === "network"
+			? committedForScope
+			: (localFallbackState ?? committedForScope);
 	const visibleSorted = activeCommittedState?.sorted ?? EMPTY_SORTED_COLLECTIONS;
 	const visibleDisplayLabelMap =
 		activeCommittedState?.displayLabelMap ?? EMPTY_DISPLAY_LABEL_MAP;
@@ -1504,15 +1522,12 @@ export default function CollectionsPage() {
 
 	const collectionTask = visibleCollectionTasks[0];
 	const displayError = collectionsQuery.error ?? calendarQuery.error;
-	const isDisplayLoading =
-		collectionsQuery.isLoading ||
-		(!activeCommittedState &&
-			!collectionsQuery.isError &&
-			(!isDisplayDependencyError || canCommitCacheSnapshot));
+	// 只等待本地快照完成提交；网络刷新和辅助数据请求不再阻塞首屏。
 	const isDisplayError =
 		!activeCommittedState &&
 		!canCommitCacheSnapshot &&
 		(isDisplayDependencyError || (collectionsQuery.isError && !collectionsQuery.data));
+	const isDisplayLoading = !activeCommittedState && !isDisplayError;
 	if (checking) return <LoadingState label="检查登录状态" />;
 	if (!loggedIn) return <LoadingState label="跳转登录" />;
 

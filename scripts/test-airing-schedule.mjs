@@ -16,6 +16,10 @@ import {
 	getDisplayLabel,
 	sortCollections,
 } from "../shared/sort-collections.ts";
+import {
+	isAiringRecordDisplayable,
+	toAiringObservation,
+} from "../shared/airing-cache.ts";
 
 function jstTimestamp(date, hour, minute) {
 	const [year, month, day] = date.split("-").map(Number);
@@ -408,6 +412,30 @@ assert.equal(
 	cachedSignalSorted[0].group,
 	"airing_not_caught",
 	"新版在播缓存应在日历和网络刷新完成前保留未追上分组",
+);
+
+const staleAiringRecord = {
+	status: "scheduled",
+	airingAt: jstTimestamp("2026-08-21", 22, 0) / 1000,
+	episode: 5,
+	fetchedAt: beforeNow - 1000 * 60 * 60 * 24 * 30,
+};
+assert.equal(isAiringRecordDisplayable(staleAiringRecord), true);
+const staleAiringObservation = toAiringObservation(staleAiringRecord);
+assert.ok(staleAiringObservation);
+const staleCachedSorted = sortCollections(
+	[cachedSignalCollection],
+	[],
+	{
+		nowMs: beforeNow,
+		airedEpMap: new Map([[cachedSignalSubject.id, 5]]),
+		airingSignalMap: new Map([[cachedSignalSubject.id, staleAiringObservation]]),
+	},
+);
+assert.equal(
+	staleCachedSorted[0].group,
+	"airing_not_caught",
+	"过期的本地排期缓存也应先支撑首个排序分组",
 );
 
 process.stdout.write("airing schedule: 全部通过 ✓\n");

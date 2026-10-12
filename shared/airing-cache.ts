@@ -40,6 +40,13 @@ export function isAiringRecordUsable(
 	return nowMs - record.fetchedAt <= maxAge;
 }
 
+/** 过期记录仍可用于首屏分组；是否刷新由 shouldRefreshAiringRecord 决定。 */
+export function isAiringRecordDisplayable(
+	value: unknown,
+): value is AiringCacheRecord {
+	return isAiringCacheRecord(value);
+}
+
 export function shouldRefreshAiringRecord(
 	record: AiringCacheRecord | undefined,
 	nowMs: number,

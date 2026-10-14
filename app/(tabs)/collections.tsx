@@ -2,9 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	AppState,
 	SectionList,
-	Pressable,
 	RefreshControl,
-	ScrollView,
 	StyleSheet,
 	Text,
 	View,
@@ -12,7 +10,6 @@ import {
 import * as Clipboard from "expo-clipboard";
 import { router, useFocusEffect } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ionicons } from "@expo/vector-icons";
 
 import {
 	getAllEpisodes,
@@ -75,15 +72,11 @@ import {
 } from "../../shared/storage/sqlite-cache";
 import { getSubjectTitleForCopy } from "../../src/api/subject-title-copy";
 import {
-	getCollectionTaskQueue,
-	getCollectionTaskSummary,
 	getOptimisticCollectionPatchForSubject,
-	ignoreCollectionTask,
-	retryCollectionTask,
 	startCollectionTaskWorker,
-	subscribeCollectionTaskQueue,
 	type CollectionTask,
 } from "../../src/api/collection-tasks";
+import { useCollectionTaskQueue } from "../../src/components/CollectionTaskDock";
 import { useHeaderSearch } from "../../src/components/SearchInput";
 import { SegmentedControl } from "../../src/components/SegmentedControl";
 import {
@@ -439,12 +432,6 @@ function matchesSearch(collection: UserCollection, query: string) {
 	return haystack.includes(query);
 }
 
-function getTaskStatusLabel(task: CollectionTask) {
-	if (task.status === "failed") return "同步失败";
-	if (task.status === "running") return "同步中";
-	return "等待同步";
-}
-
 function getTaskPriority(task: CollectionTask) {
 	if (task.status === "failed") return 0;
 	if (task.status === "running") return 1;
@@ -516,8 +503,7 @@ export default function CollectionsPage() {
 		placeholder: `搜索${CollectionTypeLabel[collectionType]}`,
 	});
 	const [page, setPage] = useState(1);
-	const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
-	const [taskPanelExpanded, setTaskPanelExpanded] = useState(false);
+	const collectionTasks = useCollectionTaskQueue();
 	const [nowMs, setNowMs] = useState(() => Date.now());
 	const [isPageFocused, setIsPageFocused] = useState(false);
 	const [cachedCollectionsSnapshot, setCachedCollectionsSnapshot] = useState<
@@ -594,22 +580,6 @@ export default function CollectionsPage() {
 			startCollectionTaskWorker(queryClient);
 		}
 	}, [checking, loggedIn, queryClient]);
-
-	useEffect(() => {
-		let cancelled = false;
-		const syncCollectionTasks = () => {
-			void getCollectionTaskQueue().then((tasks) => {
-				if (!cancelled) setCollectionTasks(tasks);
-			});
-		};
-
-		syncCollectionTasks();
-		const unsubscribe = subscribeCollectionTaskQueue(syncCollectionTasks);
-		return () => {
-			cancelled = true;
-			unsubscribe();
-		};
-	}, []);
 
 	const collectionsCacheKey = `collections-${collectionType}-${username}`;
 	const collectionsQueryKey = [
@@ -1443,12 +1413,6 @@ export default function CollectionsPage() {
 		if (page > totalPages) setPage(totalPages);
 	}, [totalPages, page]);
 
-	useEffect(() => {
-		if (visibleCollectionTasks.length === 0) {
-			setTaskPanelExpanded(false);
-		}
-	}, [visibleCollectionTasks.length]);
-
 	async function refresh() {
 		if (!username) return;
 		setRefreshing(true);
@@ -1520,7 +1484,6 @@ export default function CollectionsPage() {
 		alert("已复制", title);
 	}
 
-	const collectionTask = visibleCollectionTasks[0];
 	const displayError = collectionsQuery.error ?? calendarQuery.error;
 	// 只等待本地快照完成提交；网络刷新和辅助数据请求不再阻塞首屏。
 	const isDisplayError =
@@ -1561,11 +1524,7 @@ export default function CollectionsPage() {
 						);
 						const pageListContentStyle = [
 							pageItems.length ? styles.list : styles.emptyList,
-							collectionTask
-								? taskPanelExpanded
-									? styles.listWithExpandedTaskDock
-									: styles.listWithTaskDock
-								: null,
+							visibleCollectionTasks.length > 0 ? styles.listWithTaskDock : null,
 						];
 
 						return (
@@ -1655,111 +1614,6 @@ export default function CollectionsPage() {
 				/>
 			)}
 
-			{collectionTask ? (
-				<View pointerEvents="box-none" style={styles.taskDock}>
-					<View style={[styles.taskCapsule, taskPanelExpanded && styles.taskPanel]}>
-						<Pressable
-							style={styles.taskHeader}
-							onPress={() => setTaskPanelExpanded((value) => !value)}
-						>
-							<View
-								style={[
-									styles.taskIcon,
-									collectionTask.status === "failed" && styles.taskIconDanger,
-									collectionTask.status === "running" && styles.taskIconActive,
-								]}
-							>
-								<Ionicons
-									name={
-										collectionTask.status === "failed"
-											? "alert-circle"
-											: collectionTask.status === "running"
-												? "sync"
-												: "time-outline"
-									}
-									size={16}
-									color={
-										collectionTask.status === "failed" ? colors.danger : colors.primary
-									}
-								/>
-							</View>
-							<View style={styles.taskHeaderText}>
-								<Text style={styles.taskTitle} numberOfLines={1}>
-									{getCollectionTaskSummary(collectionTask)}
-								</Text>
-								<Text
-									style={[
-										styles.taskMeta,
-										collectionTask.status === "failed" && styles.taskError,
-									]}
-									numberOfLines={1}
-								>
-									{getTaskStatusLabel(collectionTask)}
-									{visibleCollectionTasks.length > 1
-										? ` · 共 ${visibleCollectionTasks.length} 个任务`
-										: ""}
-								</Text>
-							</View>
-							{visibleCollectionTasks.length > 1 ? (
-								<View style={styles.taskCountPill}>
-									<Text style={styles.taskCountText}>
-										{visibleCollectionTasks.length}
-									</Text>
-								</View>
-							) : null}
-							<Ionicons
-								name={taskPanelExpanded ? "chevron-down" : "chevron-up"}
-								size={18}
-								color={colors.muted}
-							/>
-						</Pressable>
-
-						{taskPanelExpanded ? (
-							<ScrollView
-								style={styles.taskList}
-								contentContainerStyle={styles.taskListContent}
-							>
-								{visibleCollectionTasks.map((task) => (
-									<View key={task.id} style={styles.taskItem}>
-										<View style={styles.taskItemText}>
-											<Text style={styles.taskItemTitle} numberOfLines={1}>
-												{getCollectionTaskSummary(task)}
-											</Text>
-											<Text
-												style={[
-													styles.taskItemMeta,
-													task.status === "failed" && styles.taskError,
-												]}
-												numberOfLines={1}
-											>
-												{task.status === "failed" && task.lastError
-													? task.lastError
-													: getTaskStatusLabel(task)}
-											</Text>
-										</View>
-										{task.status === "failed" ? (
-											<Pressable
-												style={styles.taskActionButton}
-												onPress={() => void retryCollectionTask(task.id)}
-											>
-												<Ionicons name="refresh" size={15} color={colors.primary} />
-											</Pressable>
-										) : null}
-										{task.status !== "running" ? (
-											<Pressable
-												style={styles.taskActionButton}
-												onPress={() => void ignoreCollectionTask(task.id)}
-											>
-												<Ionicons name="close" size={16} color={colors.muted} />
-											</Pressable>
-										) : null}
-									</View>
-								))}
-							</ScrollView>
-						) : null}
-					</View>
-				</View>
-			) : null}
 		</View>
 	);
 }
@@ -1775,134 +1629,14 @@ const styles = StyleSheet.create({
 		paddingBottom: 28,
 	},
 	listWithTaskDock: {
-		paddingBottom: 104,
-	},
-	listWithExpandedTaskDock: {
-		paddingBottom: 238,
+		// 全局同步面板展开时最高约占用 280px，预留空间避免遮挡末尾条目。
+		paddingBottom: 284,
 	},
 	emptyList: {
 		flexGrow: 1,
 		padding: 16,
 	},
-	taskDock: {
-		position: "absolute",
-		left: 14,
-		right: 14,
-		bottom: 14,
-	},
-	taskCapsule: {
-		borderRadius: 24,
-		borderWidth: StyleSheet.hairlineWidth,
-		borderColor: colors.border,
-		backgroundColor: colors.surfaceAlt,
-		shadowColor: "#000",
-		shadowOpacity: 0.28,
-		shadowRadius: 16,
-		shadowOffset: { width: 0, height: 8 },
-		elevation: 14,
-		overflow: "hidden",
-	},
-	taskPanel: {
-		borderRadius: 18,
-	},
-	taskHeader: {
-		minHeight: 58,
-		flexDirection: "row",
-		alignItems: "center",
-		gap: 10,
-		paddingHorizontal: 12,
-		paddingVertical: 10,
-	},
-	taskIcon: {
-		width: 34,
-		height: 34,
-		borderRadius: 17,
-		alignItems: "center",
-		justifyContent: "center",
-		backgroundColor: colors.chip,
-	},
-	taskIconActive: {
-		backgroundColor: colors.primaryMuted,
-	},
-	taskIconDanger: {
-		backgroundColor: "#3a2429",
-	},
-	taskHeaderText: {
-		flex: 1,
-		minWidth: 0,
-	},
-	taskTitle: {
-		color: colors.text,
-		fontSize: 13,
-		fontWeight: "800",
-	},
-	taskMeta: {
-		marginTop: 2,
-		color: colors.muted,
-		fontSize: 12,
-		fontWeight: "600",
-	},
-	taskError: {
-		color: colors.danger,
-	},
-	taskCountPill: {
-		minWidth: 24,
-		height: 24,
-		alignItems: "center",
-		justifyContent: "center",
-		paddingHorizontal: 7,
-		borderRadius: 12,
-		backgroundColor: colors.chip,
-	},
-	taskCountText: {
-		color: colors.primary,
-		fontSize: 12,
-		fontWeight: "800",
-	},
-	taskList: {
-		maxHeight: 220,
-		borderTopWidth: StyleSheet.hairlineWidth,
-		borderTopColor: colors.border,
-	},
-	taskListContent: {
-		gap: 7,
-		padding: 8,
-	},
-	taskItem: {
-		minHeight: 50,
-		flexDirection: "row",
-		alignItems: "center",
-		gap: 8,
-		paddingLeft: 10,
-		paddingRight: 6,
-		paddingVertical: 7,
-		borderRadius: 12,
-		backgroundColor: colors.surface,
-	},
-	taskItemText: {
-		flex: 1,
-		minWidth: 0,
-	},
-	taskItemTitle: {
-		color: colors.text,
-		fontSize: 12,
-		fontWeight: "700",
-	},
-	taskItemMeta: {
-		marginTop: 2,
-		color: colors.muted,
-		fontSize: 11,
-	},
-	taskActionButton: {
-		width: 32,
-		height: 32,
-		alignItems: "center",
-		justifyContent: "center",
-		borderRadius: 16,
-		borderWidth: StyleSheet.hairlineWidth,
-		borderColor: colors.border,
-		backgroundColor: colors.background,
-	},
+
 	separator: {
 		height: 10,
 	},

@@ -9,11 +9,19 @@ import {
 } from "../../shared/api/client";
 import type { CollectionType, Episode, PagedResponse, UserCollection } from "../../shared/api/types";
 import {
+  applyCollectionPatch,
+  mergeCollectionPatchIntoList,
+  removeCollection,
+  updateCollectionListForType,
+  upsertCollection,
+} from "../../shared/collection-cache";
+import {
   completePersistentCollectionTask,
   deletePersistentCollectionTask,
   markPersistentCollectionTaskFailed,
   markPersistentCollectionTaskRunning,
-  readCachedValue,
+  readCachedCollection,
+  readCachedValueEntryAllowStale,
   readDuePersistentCollectionTask,
   readNextPersistentCollectionTaskRunAt,
   readPersistentCollectionTasks,
@@ -189,75 +197,76 @@ function getExpectedNextType(task: CollectionTask): CollectionType | undefined {
   return undefined;
 }
 
-function upsertCollection(data: PagedResponse<UserCollection>, collection: UserCollection): PagedResponse<UserCollection> {
-  const idx = data.data.findIndex((item) => item.subject_id === collection.subject_id);
-  if (idx >= 0) {
-    const next = [...data.data];
-    next[idx] = collection;
-    return { ...data, data: next };
+export function mergePendingCollectionTasks({
+  data,
+  currentData,
+  tasks,
+  cachedCollections,
+  username,
+  collectionType,
+}: {
+  data: PagedResponse<UserCollection>;
+  currentData?: PagedResponse<UserCollection>;
+  tasks: CollectionTask[];
+  cachedCollections?: UserCollection[];
+  username: string;
+  collectionType: CollectionType;
+}): PagedResponse<UserCollection> {
+  const userTasks = tasks.filter((task) => task.payload.username === username);
+  const subjectIds = new Set(userTasks.map((task) => getTaskSubjectId(task)));
+  if (subjectIds.size === 0) return data;
+
+  const fallbackBySubjectId = new Map<number, UserCollection>();
+  for (const collection of cachedCollections ?? []) {
+    fallbackBySubjectId.set(collection.subject_id, collection);
+  }
+  // 当前内存比 SQLite 快照更新，作为缺失条目的优先回填来源。
+  for (const collection of currentData?.data ?? []) {
+    fallbackBySubjectId.set(collection.subject_id, collection);
   }
 
-  return {
-    ...data,
-    total: data.total + 1,
-    data: [collection, ...data.data],
-  };
+  let mergedData = data;
+  for (const subjectId of subjectIds) {
+    const patch = getOptimisticCollectionPatchForSubject(subjectId, userTasks);
+    if (!patch) continue;
+    mergedData = mergeCollectionPatchIntoList({
+      data: mergedData,
+      subjectId,
+      patch,
+      collectionType,
+      fallbackCollection: fallbackBySubjectId.get(subjectId),
+    });
+  }
+  return mergedData;
 }
 
-function removeCollection(data: PagedResponse<UserCollection>, subjectId: number): PagedResponse<UserCollection> {
-  const idx = data.data.findIndex((item) => item.subject_id === subjectId);
-  if (idx < 0) return data;
-
-  const next = [...data.data];
-  next.splice(idx, 1);
-  return {
-    ...data,
-    total: Math.max(0, data.total - 1),
-    data: next,
-  };
-}
-
-async function syncCollectionCaches(username: string, collection: UserCollection, previousType?: CollectionType) {
-  await writeCachedCollection(username, collection);
+function publishCollectionToQueryCaches(username: string, collection: UserCollection) {
   queryClient?.setQueryData(["collection", username, collection.subject_id], collection);
-
-  const currentCacheKey = `${COLLECTIONS_CACHE_PREFIX}${collection.type}-${username}`;
-  const currentCached = await readCachedValue<PagedResponse<UserCollection>>(currentCacheKey);
-  if (currentCached?.data) {
-    await writeCachedValue(currentCacheKey, upsertCollection(currentCached, collection));
-  }
-
-  queryClient?.setQueryData<PagedResponse<UserCollection>>(
-    ["collections", collection.type, username],
-    (old) => old ? upsertCollection(old, collection) : old,
-  );
-
-  const typesToRemoveFrom = previousType && previousType !== collection.type
-    ? [previousType]
-    : COLLECTION_TYPES.filter((type) => type !== collection.type);
-
-  for (const type of typesToRemoveFrom) {
-    const cacheKey = `${COLLECTIONS_CACHE_PREFIX}${type}-${username}`;
-    const cached = await readCachedValue<PagedResponse<UserCollection>>(cacheKey);
-    if (cached?.data) {
-      await writeCachedValue(cacheKey, removeCollection(cached, collection.subject_id));
-    }
-
+  for (const type of COLLECTION_TYPES) {
     queryClient?.setQueryData<PagedResponse<UserCollection>>(
       ["collections", type, username],
-      (old) => old ? removeCollection(old, collection.subject_id) : old,
+      (old) => updateCollectionListForType(old, collection, type),
     );
   }
-
-  await queryClient?.invalidateQueries({ queryKey: ["collections"] });
-  await queryClient?.invalidateQueries({ queryKey: ["episode-totals"] });
-  await queryClient?.invalidateQueries({ queryKey: ["aired-episodes"] });
 }
 
-async function fetchAndSyncCollection(username: string, subjectId: number, previousType?: CollectionType) {
-  const collection = await getUserCollection(username, subjectId);
-  await syncCollectionCaches(username, collection, previousType);
-  return collection;
+async function syncCollectionCaches(username: string, collection: UserCollection) {
+  // 旧任务的最终确认也可能迟于新意图；界面始终投影该用户剩余队列。
+  const tasks = (await getCollectionTaskQueue()).filter((task) => task.payload.username === username);
+  const patch = getOptimisticCollectionPatchForSubject(collection.subject_id, tasks);
+  publishCollectionToQueryCaches(username, patch ? applyCollectionPatch(collection, patch) : collection);
+
+  // 内存先一次性提交；持久化仅存服务端基础值，不将尚未成功的意图落盘。
+  await writeCachedCollection(username, collection);
+  for (const type of COLLECTION_TYPES) {
+    const cacheKey = `${COLLECTIONS_CACHE_PREFIX}${type}-${username}`;
+    const cached = await readCachedValueEntryAllowStale<PagedResponse<UserCollection>>(cacheKey);
+    if (!cached?.payload.data) continue;
+    await writeCachedValue(cacheKey, type === collection.type
+      ? upsertCollection(cached.payload, collection)
+      : removeCollection(cached.payload, collection.subject_id));
+  }
+  // 收藏进度不会改变剧集总数和播出排期，不触发整页及排期查询失效。
 }
 
 async function fetchCollectionOrNull(username: string, subjectId: number) {
@@ -269,15 +278,12 @@ async function fetchCollectionOrNull(username: string, subjectId: number) {
   }
 }
 
-async function ensureCollectionType(username: string, subjectId: number, nextType: CollectionType, previousType?: CollectionType) {
+async function ensureCollectionType(username: string, subjectId: number, nextType: CollectionType) {
   const current = await fetchCollectionOrNull(username, subjectId);
-  if (current?.type === nextType) {
-    await syncCollectionCaches(username, current, previousType);
-    return current;
-  }
+  if (current?.type === nextType) return current;
 
   await postUserCollection(subjectId, { type: nextType });
-  return fetchAndSyncCollection(username, subjectId, current?.type ?? previousType);
+  return getUserCollection(username, subjectId);
 }
 
 async function fetchEpisodesForProgress(subjectId: number) {
@@ -296,9 +302,9 @@ function getMainEpisodeIdsBetween(episodes: Episode[], fromEp: number, toEp: num
 }
 
 async function executeProgressTask(payload: SetProgressTaskPayload | CompleteProgressTaskPayload) {
-  const { username, subjectId, targetEp, ensureWatching, previousType } = payload;
+  const { username, subjectId, targetEp, ensureWatching } = payload;
   let collection = ensureWatching
-    ? await ensureCollectionType(username, subjectId, 3, previousType)
+    ? await ensureCollectionType(username, subjectId, 3)
     : await fetchCollectionOrNull(username, subjectId);
 
   if (!collection) {
@@ -323,14 +329,12 @@ async function executeProgressTask(payload: SetProgressTaskPayload | CompletePro
       });
     }
 
-    collection = await fetchAndSyncCollection(username, subjectId, collection.type);
-  } else {
-    await syncCollectionCaches(username, collection, previousType);
+    collection = await getUserCollection(username, subjectId);
   }
 
   if ("markWatched" in payload && payload.markWatched && collection.type !== 2) {
     await postUserCollection(subjectId, { type: 2 });
-    collection = await fetchAndSyncCollection(username, subjectId, collection.type);
+    collection = await getUserCollection(username, subjectId);
   }
 
   return collection;
@@ -342,7 +346,6 @@ async function executeCollectionTask(task: CollectionTask) {
       task.payload.username,
       task.payload.subjectId,
       task.payload.nextType,
-      task.payload.previousType,
     );
   }
 
@@ -412,8 +415,42 @@ export async function retryCollectionTask(id: string) {
 }
 
 export async function ignoreCollectionTask(id: string) {
-  await deletePersistentCollectionTask(id);
-  emitCollectionTaskQueueChanged();
+  try {
+    const task = (await getCollectionTaskQueue()).find((item) => item.id === id);
+    await deletePersistentCollectionTask(id);
+    if (!task) return;
+
+    const { username, subjectId } = task.payload;
+    try {
+      // QueryData 可能已包含被忽略任务的投影，必须从磁盘确认值恢复，不能拿它作基础。
+      let collection = await readCachedCollection(username, subjectId);
+      if (!collection) {
+        for (const type of COLLECTION_TYPES) {
+          const cached = await readCachedValueEntryAllowStale<PagedResponse<UserCollection>>(
+            `${COLLECTIONS_CACHE_PREFIX}${type}-${username}`,
+          );
+          collection = cached?.payload.data?.find((item) => item.subject_id === subjectId) ?? null;
+          if (collection) break;
+        }
+      }
+      if (collection) {
+        const remaining = (await getCollectionTaskQueue()).filter((item) => item.payload.username === username);
+        const patch = getOptimisticCollectionPatchForSubject(subjectId, remaining);
+        publishCollectionToQueryCaches(username, patch ? applyCollectionPatch(collection, patch) : collection);
+      }
+    } finally {
+      // 缺少基础值或离线时先保留可用缓存，联网后仅回源该用户的相关查询。
+      await Promise.all([
+        queryClient?.invalidateQueries({ queryKey: ["collection", username, subjectId], exact: true }),
+        queryClient?.invalidateQueries({
+          predicate: (query) => query.queryKey[0] === "collections" && query.queryKey[2] === username,
+        }),
+      ]);
+    }
+  } finally {
+    // 恢复/回源失败也不能漏通知，否则任务面板和列表会一直保留旧队列。
+    emitCollectionTaskQueueChanged();
+  }
 }
 
 export function getOptimisticCollectionPatchForSubject(
@@ -479,6 +516,8 @@ export async function kickCollectionTaskWorker() {
 
       try {
         const collection = await executeCollectionTask(task);
+        // 进度与收藏类型全部更新后才提交，不能将任务中间读回暴露给界面。
+        await syncCollectionCaches(task.payload.username, collection);
         await completePersistentCollectionTask(task.id);
         emitCollectionTaskEvent({
           taskId: task.id,

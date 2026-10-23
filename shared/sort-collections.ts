@@ -68,6 +68,7 @@ export interface SortCollectionsOptions {
 	airedEpMap: ReadonlyMap<number, number>;
 	airingSignalMap?: ReadonlyMap<number, unknown>;
 	nextAiringAtMap?: ReadonlyMap<number, number>;
+	airingStateOverrides?: ReadonlyMap<number, boolean>;
 }
 
 export interface DisplayLabelOptions {
@@ -102,9 +103,10 @@ export function getCollectionMeta(
 		(c.subject.date ? getWeekdayFromDate(c.subject.date) : 0);
 	const totalEp = getTotalEp(c);
 	// BGM 日历为主要在播信号；AniList 仅在 BGM 日历缺失时辅助判定。
-	const isAiring =
+	const isAiring = options.airingStateOverrides?.get(c.subject_id) ?? (
 		airingMap.has(c.subject_id) ||
-		Boolean(options.airingSignalMap?.has(c.subject_id));
+		Boolean(options.airingSignalMap?.has(c.subject_id))
+	);
 	const knownAiredEp = isAiring ? options.airedEpMap.get(c.subject_id) : totalEp;
 	// BGM 剧集数据完全缺失时保持当前进度，不因网络错误制造已播集数。
 	const airedEp = knownAiredEp ?? c.ep_status;

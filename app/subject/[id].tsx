@@ -12,6 +12,7 @@ import {
   getSubjectRelations,
   getUserCollection,
 } from "../../shared/api/client";
+import { applySubjectAiringOffset } from "../../shared/airing-offset";
 import { CollectionTypeLabel } from "../../shared/api/types";
 import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, SubjectRelation, UserCollection } from "../../shared/api/types";
 import {
@@ -41,9 +42,11 @@ import {
   subscribeCollectionTaskQueue,
   type CollectionTask,
 } from "../../src/api/collection-tasks";
+import AiringOffsetControl from "../../src/components/AiringOffsetControl";
 import CachedImage from "../../src/components/CachedImage";
 import ImageViewer from "../../src/components/ImageViewer";
 import { EmptyState, LoadingState } from "../../src/components/ScreenState";
+import { useAiringOffsets } from "../../src/hooks/useAiringOffsets";
 import { useAuth } from "../../src/hooks/useAuth";
 import { colors } from "../../src/theme/colors";
 import { useAlert } from "../../src/components/Dialog";
@@ -200,9 +203,14 @@ function getTotalEpisodes(subject?: Subject | null, episodes?: PagedResponse<Epi
   return subject?.total_episodes || subject?.eps || 0;
 }
 
-function getAirWeekdayLabel(weekday?: number) {
+function getAirWeekdayLabel(weekday?: number, date?: string) {
   const labels = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
-  return weekday ? labels[weekday] : null;
+  if (weekday && labels[weekday]) return labels[weekday];
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+
+  const parsedDate = new Date(`${date}T00:00:00Z`);
+  if (!Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date) return null;
+  return labels[parsedDate.getUTCDay() || 7];
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -259,6 +267,8 @@ export default function SubjectDetailPage() {
   const subjectId = Number(params.id);
   const queryClient = useQueryClient();
   const { loggedIn, username, checking } = useAuth();
+  const airingOffsets = useAiringOffsets();
+  const airingOffsetDays = airingOffsets[subjectId] ?? 0;
   const [targetEp, setTargetEp] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -427,6 +437,19 @@ export default function SubjectDetailPage() {
   const episodes = episodesQuery.data;
   const collection = collectionQuery.data;
   const totalEp = getTotalEpisodes(subject, episodes);
+  const originalAirWeekdayLabel = getAirWeekdayLabel(subject?.air_weekday, subject?.date);
+  // 仅生成放送日期的展示投影，不修改 Query cache、持久化数据或剧集进度。
+  const airingSubject = subject?.type === 2
+    ? applySubjectAiringOffset(subject, airingOffsetDays)
+    : subject;
+  const airWeekdayLabel = getAirWeekdayLabel(airingSubject?.air_weekday, airingSubject?.date);
+  const previewEpisode = useMemo(
+    () => episodes?.data
+      ?.filter((episode) => episode.type === 0)
+      .sort((a, b) => a.sort - b.sort)
+      .find((episode) => getAirWeekdayLabel(undefined, episode.airdate) !== null),
+    [episodes],
+  );
 
   const [crossSeasonCount, setCrossSeasonCount] = useState(false);
   useEffect(() => {
@@ -593,6 +616,8 @@ export default function SubjectDetailPage() {
   return (
     <>
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="on-drag"
       refreshControl={
         <RefreshControl refreshing={refreshing} onRefresh={handleRefresh}
           tintColor={colors.primary} colors={[colors.primary]} />
@@ -640,16 +665,31 @@ export default function SubjectDetailPage() {
               <Text style={styles.meta}>{subject.rank || subject.rating?.rank ? `排名 #${subject.rank || subject.rating?.rank}` : "暂无排名"}</Text>
             </CopyText>
             <CopyText text={subject.date || "日期未知"}>
-              <Text style={styles.meta}>{subject.date || "日期未知"}</Text>
+              <Text style={styles.meta}>
+                {subject.type === 2 ? "Bangumi 原始放送 " : ""}{subject.date || "日期未知"}
+                {originalAirWeekdayLabel ? ` (${originalAirWeekdayLabel})` : ""}
+              </Text>
             </CopyText>
-            {getAirWeekdayLabel(subject.air_weekday) ? (
-              <CopyText text={getAirWeekdayLabel(subject.air_weekday)!}>
-                <Text style={styles.meta}>{getAirWeekdayLabel(subject.air_weekday)}</Text>
-              </CopyText>
+            {subject.type === 2 && airingOffsetDays !== 0 ? (
+              <Text style={[styles.meta, styles.correctedAirDate]} accessibilityLiveRegion="polite">
+                修正后放送 {airingSubject?.date || "暂无日期，无法推算"}
+                {airWeekdayLabel ? ` (${airWeekdayLabel})` : ""}
+              </Text>
             ) : null}
           </View>
         </View>
       </View>
+
+      {subject.type === 2 ? (
+        <AiringOffsetControl
+          key={subjectId}
+          subjectId={subjectId}
+          appliedDays={airingOffsetDays}
+          originalDate={subject.date}
+          airWeekday={subject.air_weekday}
+          previewEpisode={previewEpisode}
+        />
+      ) : null}
 
       <Section title="收藏状态">
         {checking ? <Text style={styles.muted}>检查登录状态</Text> : null}
@@ -867,6 +907,9 @@ const styles = StyleSheet.create({
     color: colors.muted,
     backgroundColor: colors.chip,
     fontSize: 12,
+  },
+  correctedAirDate: {
+    color: colors.primary,
   },
   section: {
     gap: 10,

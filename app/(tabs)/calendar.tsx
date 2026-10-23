@@ -11,6 +11,8 @@ import { router } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCalendar } from "../../shared/api/client";
 import type { CalendarItem, SubjectSmall } from "../../shared/api/types";
+import { applyCalendarAiringOffsets, formatAiringOffsetDays } from "../../shared/airing-offset";
+import { useAiringOffsets } from "../../src/hooks/useAiringOffsets";
 import {
   getTodayBangumiWeekday,
   WEEKDAY_CN,
@@ -85,6 +87,7 @@ type CalendarSection = { title: string; weekday: number; data: SubjectSmall[] };
 export default function CalendarPage() {
   const alert = useAlert();
   const queryClient = useQueryClient();
+  const airingOffsets = useAiringOffsets();
   const [weekday, setWeekday] = useState(() =>
     getTodayBangumiWeekday(Date.now()),
   );
@@ -101,6 +104,12 @@ export default function CalendarPage() {
     queryKey: ["calendar"],
     queryFn: () => loadCalendar(),
   });
+
+  // 偏置仅作为展示投影，源排期仍按原样缓存与后台刷新。
+  const calendar = useMemo(
+    () => calendarQuery.data && applyCalendarAiringOffsets(calendarQuery.data, airingOffsets),
+    [calendarQuery.data, airingOffsets],
+  );
 
   const bgRefreshedRef = useRef(false);
 
@@ -132,15 +141,15 @@ export default function CalendarPage() {
   const isSearching = !!searchQuery;
 
   const allItems = useMemo((): EnrichedItem[] => {
-    if (!calendarQuery.data) return [];
+    if (!calendar) return [];
     const items: EnrichedItem[] = [];
-    for (const day of calendarQuery.data) {
+    for (const day of calendar) {
       for (const item of day.items) {
         items.push({ ...item, weekday: day.weekday.id });
       }
     }
     return items;
-  }, [calendarQuery.data]);
+  }, [calendar]);
 
   const searchedItems = useMemo(() => {
     if (!isSearching) return [];
@@ -183,6 +192,9 @@ export default function CalendarPage() {
       title={item.name_cn || item.name}
       subtitle={item.name}
       coverUrl={getPreferredSubjectCoverUrl(item)}
+      badges={airingOffsets[item.id]
+        ? [{ text: `手动${formatAiringOffsetDays(airingOffsets[item.id])}` }]
+        : undefined}
       meta={[
         item.air_date || "日期未知",
         item.rating?.score
@@ -245,7 +257,7 @@ export default function CalendarPage() {
           pageCount={LAST_WEEKDAY}
           onPageChange={setWeekday}
           renderPage={(pageValue) => {
-            const pageDay = calendarQuery.data?.find(
+            const pageDay = calendar?.find(
               (item) => item.weekday.id === pageValue,
             );
             const pageItems = pageDay?.items ?? [];

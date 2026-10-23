@@ -16,6 +16,7 @@ import {
   invalidateAuthSession,
 } from "../src/api/oauth";
 import { startCollectionTaskWorker } from "../src/api/collection-tasks";
+import { initializeAiringOffsets } from "../src/api/airing-offset";
 import { DialogProvider, useAlert } from "../src/components/Dialog";
 import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { colors } from "../src/theme/colors";
@@ -94,6 +95,7 @@ function CollectionTaskWorkerBootstrap() {
 export default function RootLayout() {
   const [fontsLoaded] = useFonts(Ionicons.font);
   const [ready, setReady] = useState(false);
+  const [airingOffsetsReady, setAiringOffsetsReady] = useState(false);
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
@@ -123,7 +125,16 @@ export default function RootLayout() {
     setReady(true);
   }, []);
 
-  const allReady = fontsLoaded && ready;
+  useEffect(() => {
+    let cancelled = false;
+    // 首屏前恢复本地排期，避免重启后先按默认日期分组、再跳到修正后的分组。
+    void initializeAiringOffsets()
+      .catch((error) => console.warn("[airing-offset] failed to restore preferences", error))
+      .finally(() => { if (!cancelled) setAiringOffsetsReady(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const allReady = fontsLoaded && ready && airingOffsetsReady;
 
   useEffect(() => {
     if (allReady) {

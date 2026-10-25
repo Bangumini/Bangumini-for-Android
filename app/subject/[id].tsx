@@ -1,38 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { router, useLocalSearchParams } from "expo-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
-import {
-  getEpisodes,
-  getSubject,
-  getSubjectCharacters,
-  getSubjectPersons,
-  getSubjectRelations,
-  getUserCollection,
-} from "../../shared/api/client";
+import { useSubjectDetailData } from "../../src/hooks/useSubjectDetailData";
 import { applySubjectAiringOffset } from "../../shared/airing-offset";
 import { CollectionTypeLabel } from "../../shared/api/types";
-import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, SubjectRelation, UserCollection } from "../../shared/api/types";
-import {
-  deleteCachedCollection,
-  getPreferredSubjectCoverUrl,
-  readCachedCharactersWithin,
-  readCachedCollection,
-  readCachedCollectionWithin,
-  readCachedEpisodesWithin,
-  readCachedPersonsWithin,
-  readCachedRelationsWithin,
-  readCachedSubject,
-  readCachedSubjectDeepWithin,
-  writeCachedCharacters,
-  writeCachedCollection,
-  writeCachedEpisodes,
-  writeCachedPersons,
-  writeCachedRelations,
-  writeCachedSubject,
-} from "../../shared/storage/sqlite-cache";
+import type { CollectionType, Episode, PagedResponse, RelatedCharacter, RelatedPerson, Subject, SubjectRelation } from "../../shared/api/types";
+import { getPreferredSubjectCoverUrl } from "../../shared/storage/sqlite-cache";
 import {
   enqueueCompleteProgressTask,
   enqueueSetCollectionTypeTask,
@@ -72,130 +48,7 @@ function CopyText({ text, copyText, style, children }: { text: string; copyText?
   );
 }
 
-const DETAIL_CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
-const EPISODE_CACHE_MAX_AGE = 1000 * 60 * 30;
 const COLLECTION_OPTIONS: CollectionType[] = [1, 2, 3, 4, 5];
-
-function isNotFoundError(error: unknown) {
-  return error instanceof Error && error.message.includes("Bangumi API error 404");
-}
-
-async function loadSubject(subjectId: number, force = false) {
-  if (!force) {
-    const cached = await readCachedSubjectDeepWithin(subjectId, DETAIL_CACHE_MAX_AGE);
-    // Only trust cache if it has meaningful content (summary present)
-    if (cached && cached.summary) return cached;
-    // Incomplete cache (e.g. summary missing from SlimSubject conversion) —
-    // try network first, fall back to stale cache on failure
-    if (cached) {
-      try {
-        const subject = await getSubject(subjectId);
-        return finalizeSubjectWrite(subjectId, subject);
-      } catch {
-        return cached;
-      }
-    }
-  }
-
-  const subject = await getSubject(subjectId);
-  return finalizeSubjectWrite(subjectId, subject);
-}
-
-async function finalizeSubjectWrite(subjectId: number, subject: Subject) {
-  // air_weekday is not returned by /v0/subjects/{id}, but the calendar API
-  // (loaded on the collections page) writes it to the SQLite subject cache.
-  // Backfill from cache so the merge in writeCachedSubject preserves it.
-  if (subject.air_weekday == null) {
-    const cached = await readCachedSubject(subjectId);
-    if (cached?.air_weekday != null) subject.air_weekday = cached.air_weekday;
-  }
-  return writeCachedSubject(subject);
-}
-
-async function loadCollection(username: string, subjectId: number, force = false) {
-  if (!username) return null;
-  if (!force) {
-    const cached = await readCachedCollectionWithin(username, subjectId, DETAIL_CACHE_MAX_AGE);
-    if (cached) return cached;
-    // Stale cache fallback — individual collection data persists up to CACHE_TTL_MS (100 days)
-    const stale = await readCachedCollection(username, subjectId);
-    if (stale) return stale;
-  }
-
-  try {
-    const collection = await getUserCollection(username, subjectId);
-    await writeCachedCollection(username, collection);
-    return collection;
-  } catch (error) {
-    if (isNotFoundError(error)) {
-      await deleteCachedCollection(username, subjectId);
-      return null;
-    }
-    throw error;
-  }
-}
-
-async function loadEpisodes(subjectId: number, force = false) {
-  if (!force) {
-    const cached = await readCachedEpisodesWithin(subjectId, EPISODE_CACHE_MAX_AGE);
-    if (cached) return cached;
-  }
-  const episodes = await getEpisodes(subjectId);
-  await writeCachedEpisodes(subjectId, episodes);
-  return episodes;
-}
-
-async function loadPersons(subjectId: number) {
-  const cached = await readCachedPersonsWithin(subjectId, DETAIL_CACHE_MAX_AGE);
-  if (cached) return cached;
-  const persons = await getSubjectPersons(subjectId);
-  await writeCachedPersons(subjectId, persons);
-  return persons;
-}
-
-async function loadCharacters(subjectId: number) {
-  const cached = await readCachedCharactersWithin(subjectId, DETAIL_CACHE_MAX_AGE);
-  if (cached) return cached;
-  const characters = await getSubjectCharacters(subjectId);
-  await writeCachedCharacters(subjectId, characters);
-  return characters;
-}
-
-async function loadRelations(subjectId: number) {
-  const cached = await readCachedRelationsWithin(subjectId, DETAIL_CACHE_MAX_AGE);
-  if (cached) return cached;
-  const relations = await getSubjectRelations(subjectId);
-  await writeCachedRelations(subjectId, relations);
-  return relations;
-}
-
-async function loadArtistMap(relations: SubjectRelation[]): Promise<Record<number, string | null>> {
-  const musicRelations = relations.filter((r) => r.type === 3);
-  const map: Record<number, string | null> = {};
-
-  const results = await Promise.allSettled(
-    musicRelations.map(async (r) => {
-      const cached = await readCachedSubject(r.id);
-      if (cached?.infobox) {
-        return { id: r.id, artist: extractArtist(cached.infobox) };
-      }
-      try {
-        const subject = await getSubject(r.id);
-        await writeCachedSubject(subject);
-        return { id: r.id, artist: extractArtist(subject.infobox) };
-      } catch {
-        return { id: r.id, artist: null };
-      }
-    }),
-  );
-
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      map[result.value.id] = result.value.artist;
-    }
-  }
-  return map;
-}
 
 function getTotalEpisodes(subject?: Subject | null, episodes?: PagedResponse<Episode> | null) {
   const normalCount = episodes?.data?.filter((episode) => episode.type === 0).length;
@@ -215,20 +68,6 @@ function getAirWeekdayLabel(weekday?: number, date?: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
-}
-
-function extractArtist(infobox?: { key: string; value: string | { v: string }[] }[]): string | null {
-  if (!infobox) return null;
-  const artist = infobox.find((i) => i.key === "艺术家");
-  if (artist && typeof artist.value === "string") return artist.value;
-  const lyricist = infobox.find((i) => i.key === "作词");
-  const composer = infobox.find((i) => i.key === "作曲");
-  const parts: string[] = [];
-  if (lyricist && typeof lyricist.value === "string") parts.push(lyricist.value);
-  if (composer && typeof composer.value === "string" && (parts.length === 0 || composer.value !== parts[0])) {
-    parts.push(composer.value);
-  }
-  return parts.length > 0 ? parts.join(" / ") : null;
 }
 
 const SUMMARY_ORIGINAL_MARKER = "[简介原文]";
@@ -262,6 +101,13 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 export default function SubjectDetailPage() {
+  const params = useLocalSearchParams<{ id: string }>();
+  const { loggedIn, username } = useAuth();
+  // 条目或身份变化时同步丢弃草稿，不能等 effect 才清理上一页的进度。
+  return <SubjectDetailContent key={JSON.stringify([params.id, loggedIn ? username : null])} />;
+}
+
+function SubjectDetailContent() {
   const alert = useAlert();
   const params = useLocalSearchParams<{ id: string }>();
   const subjectId = Number(params.id);
@@ -271,7 +117,6 @@ export default function SubjectDetailPage() {
   const airingOffsetDays = airingOffsets[subjectId] ?? 0;
   const [targetEp, setTargetEp] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   const [viewerVisible, setViewerVisible] = useState(false);
   const [collectionTasks, setCollectionTasks] = useState<CollectionTask[]>([]);
 
@@ -281,57 +126,12 @@ export default function SubjectDetailPage() {
     }
   }, [checking, loggedIn, queryClient]);
 
-  async function handleRefresh() {
-    setRefreshing(true);
-    try {
-      await Promise.all([
-        subjectQuery.refetch(),
-        episodesQuery.refetch(),
-        collectionQuery.refetch(),
-      ]);
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  const subjectQuery = useQuery({
-    queryKey: ["subject", subjectId],
-    enabled: Number.isFinite(subjectId),
-    queryFn: () => loadSubject(subjectId),
-  });
-
-  const episodesQuery = useQuery({
-    queryKey: ["episodes", subjectId],
-    enabled: Number.isFinite(subjectId),
-    queryFn: () => loadEpisodes(subjectId),
-  });
-
-  const collectionQuery = useQuery({
-    queryKey: ["collection", username, subjectId],
-    enabled: loggedIn && !!username && Number.isFinite(subjectId),
-    queryFn: () => loadCollection(username, subjectId),
-  });
-
-  const personsQuery = useQuery({
-    queryKey: ["persons", subjectId],
-    enabled: Number.isFinite(subjectId),
-    queryFn: () => loadPersons(subjectId),
-  });
-
-  const charactersQuery = useQuery({
-    queryKey: ["characters", subjectId],
-    enabled: Number.isFinite(subjectId),
-    queryFn: () => loadCharacters(subjectId),
-  });
-
-  const relationsQuery = useQuery({
-    queryKey: ["relations", subjectId],
-    enabled: Number.isFinite(subjectId),
-    queryFn: () => loadRelations(subjectId),
-  });
+  const { data, loading, refreshing, refresh: handleRefresh } = useSubjectDetailData(
+    subjectId, loggedIn && username ? username : null, queryClient,
+  );
+  const { subject, episodes, collection, persons, characters, relations, artistMap } = data;
 
   const songGroups = useMemo(() => {
-    const relations = relationsQuery.data;
     if (!relations) return null;
     const ops: SubjectRelation[] = [];
     const eds: SubjectRelation[] = [];
@@ -344,84 +144,17 @@ export default function SubjectDetailPage() {
       else if (r.relation === "角色歌") characterSongs.push(r);
     }
     return { ops, eds, osts, characterSongs };
-  }, [relationsQuery.data]);
-
-  const artistMapQuery = useQuery({
-    queryKey: ["relations-artists", subjectId, relationsQuery.dataUpdatedAt],
-    enabled: !!relationsQuery.data && relationsQuery.data.length > 0,
-    queryFn: () => loadArtistMap(relationsQuery.data!),
-    staleTime: DETAIL_CACHE_MAX_AGE,
-  });
-  const artistMap = useMemo(() => artistMapQuery.data ?? {}, [artistMapQuery.data]);
-
-  // --- Background refresh: fetch network data after showing cache ---
-  const lastRefreshedKeyRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const refreshKey = `subject-${subjectId}`;
-    if (!Number.isFinite(subjectId)) return;
-    if (lastRefreshedKeyRef.current === refreshKey) return;
-    lastRefreshedKeyRef.current = refreshKey;
-
-    let cancelled = false;
-
-    const doRefresh = async () => {
-      try {
-        const results = await Promise.allSettled([
-          getSubject(subjectId).then((s) => finalizeSubjectWrite(subjectId, s)),
-          getEpisodes(subjectId),
-          username
-            ? getUserCollection(username, subjectId).catch((e) => {
-                if (isNotFoundError(e)) {
-                  deleteCachedCollection(username, subjectId);
-                  return null;
-                }
-                throw e;
-              })
-            : Promise.resolve(null),
-        ]);
-        if (cancelled) return;
-
-        const [subjectResult, episodesResult, collectionResult] = results;
-
-        if (subjectResult.status === "fulfilled") {
-          const currentSubject = queryClient.getQueryData<Subject>(["subject", subjectId]);
-          if (currentSubject && JSON.stringify(currentSubject) !== JSON.stringify(subjectResult.value)) {
-            queryClient.setQueryData(["subject", subjectId], subjectResult.value);
-          }
-        }
-
-        if (episodesResult.status === "fulfilled") {
-          const currentEpisodes = queryClient.getQueryData<PagedResponse<Episode>>(["episodes", subjectId]);
-          if (currentEpisodes && JSON.stringify(currentEpisodes) !== JSON.stringify(episodesResult.value)) {
-            queryClient.setQueryData(["episodes", subjectId], episodesResult.value);
-          }
-        }
-
-        if (collectionResult.status === "fulfilled" && username) {
-          const currentCollection = queryClient.getQueryData<UserCollection>(["collection", username, subjectId]);
-          if (
-            currentCollection
-            && JSON.stringify(currentCollection) !== JSON.stringify(collectionResult.value)
-          ) {
-            queryClient.setQueryData(["collection", username, subjectId], collectionResult.value);
-          }
-        }
-      } catch {
-        // Ignore background refresh errors
-      }
-    };
-
-    doRefresh();
-
-    return () => { cancelled = true; };
-  }, [subjectId, username, subjectQuery.data, collectionQuery.data]);
+  }, [relations]);
 
   useEffect(() => {
     let cancelled = false;
+    let readSerial = 0;
     const syncCollectionTasks = () => {
+      const serial = ++readSerial;
       void getCollectionTaskQueue().then((tasks) => {
-        if (!cancelled) setCollectionTasks(tasks);
+        if (!cancelled && serial === readSerial) setCollectionTasks(tasks);
+      }).catch(() => {
+        // 磁盘队列暂不可读时保留最后一次投影，不能清空用户的新目标。
       });
     };
 
@@ -433,9 +166,6 @@ export default function SubjectDetailPage() {
     };
   }, []);
 
-  const subject = subjectQuery.data;
-  const episodes = episodesQuery.data;
-  const collection = collectionQuery.data;
   const totalEp = getTotalEpisodes(subject, episodes);
   const originalAirWeekdayLabel = getAirWeekdayLabel(subject?.air_weekday, subject?.date);
   // 仅生成放送日期的展示投影，不修改 Query cache、持久化数据或剧集进度。
@@ -463,12 +193,12 @@ export default function SubjectDetailPage() {
   const displayedTotalEp = totalEp + episodeOffset;
 
   const subjectCollectionTasks = useMemo(
-    () => collectionTasks.filter((task) => task.payload.subjectId === subjectId),
-    [collectionTasks, subjectId],
+    () => collectionTasks.filter((task) => loggedIn && task.payload.username === username && task.payload.subjectId === subjectId),
+    [collectionTasks, subjectId, username, loggedIn],
   );
   const optimisticCollectionPatch = useMemo(
-    () => getOptimisticCollectionPatchForSubject(subjectId, collectionTasks),
-    [collectionTasks, subjectId],
+    () => getOptimisticCollectionPatchForSubject(subjectId, subjectCollectionTasks),
+    [subjectCollectionTasks, subjectId],
   );
   const activeCollectionTask = subjectCollectionTasks.find((task) => task.status === "pending" || task.status === "running");
   const failedCollectionTask = subjectCollectionTasks.find((task) => task.status === "failed");
@@ -605,7 +335,7 @@ export default function SubjectDetailPage() {
     return <EmptyState title="条目 ID 无效" />;
   }
 
-  if (subjectQuery.isLoading) {
+  if (loading) {
     return <LoadingState label="加载条目详情" />;
   }
 
@@ -774,7 +504,7 @@ export default function SubjectDetailPage() {
       </Section>
 
       <Section title="Staff">
-        {personsQuery.data?.slice(0, 16).map((person: RelatedPerson) => (
+        {persons.slice(0, 16).map((person: RelatedPerson) => (
           <CopyText key={`${person.id}-${person.relation}`} text={person.name}>
             <Text style={styles.line}>
               {person.relation} · {person.name}
@@ -784,7 +514,7 @@ export default function SubjectDetailPage() {
       </Section>
 
       <Section title="OP/ED/OST">
-        {relationsQuery.data == null ? (
+        {loading ? (
           <Text style={styles.muted}>加载中</Text>
         ) : songGroups ? (
           <>
@@ -835,7 +565,7 @@ export default function SubjectDetailPage() {
       </Section>
 
       <Section title="角色 / Cast">
-        {charactersQuery.data?.slice(0, 16).map((character: RelatedCharacter) => (
+        {characters.slice(0, 16).map((character: RelatedCharacter) => (
           <CopyText key={`${character.id}-${character.relation}`} text={character.name}>
             <Text style={styles.line}>
               {character.relation} · {character.name}

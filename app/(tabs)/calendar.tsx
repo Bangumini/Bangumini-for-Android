@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   FlatList,
   RefreshControl,
@@ -36,6 +36,7 @@ import { SubjectCard } from "../../src/components/SubjectCard";
 import { SwipePager } from "../../src/components/SwipePager";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
+import { refreshQueryDataIfChanged } from "../../src/api/stale-cache-refresh";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const LAST_WEEKDAY = 7;
@@ -102,7 +103,18 @@ export default function CalendarPage() {
 
   const calendarQuery = useQuery({
     queryKey: ["calendar"],
-    queryFn: () => loadCalendar(),
+    queryFn: async () => {
+      const cached = await readCachedValueWithin<CalendarItem[]>("calendar", CACHE_MAX_AGE)
+        ?? await readCachedValue<CalendarItem[]>("calendar");
+      const local = queryClient.getQueryData<CalendarItem[]>(["calendar"]) ?? cached;
+      if (!local) return loadCalendar(true);
+      // 与收藏页共享同一个后台任务；不能在 effect 里另起未被完成屏障跟踪的刷新。
+      void refreshQueryDataIfChanged({
+        queryClient, queryKey: ["calendar"], refreshKey: "calendar",
+        currentData: local, refresh: () => loadCalendar(true),
+      });
+      return local;
+    },
   });
 
   // 偏置仅作为展示投影，源排期仍按原样缓存与后台刷新。
@@ -110,32 +122,6 @@ export default function CalendarPage() {
     () => calendarQuery.data && applyCalendarAiringOffsets(calendarQuery.data, airingOffsets),
     [calendarQuery.data, airingOffsets],
   );
-
-  const bgRefreshedRef = useRef(false);
-
-  useEffect(() => {
-    if (!calendarQuery.data || bgRefreshedRef.current) return;
-    bgRefreshedRef.current = true;
-
-    let cancelled = false;
-
-    getCalendar()
-      .then(async (data) => {
-        if (cancelled) return;
-        await writeCachedValue("calendar", data);
-        await writeCachedSubjectPreviews(data.flatMap((day) => day.items));
-
-        const current = queryClient.getQueryData<CalendarItem[]>(["calendar"]);
-        if (current && JSON.stringify(current) !== JSON.stringify(data)) {
-          queryClient.setQueryData(["calendar"], data);
-        }
-      })
-      .catch(() => {});
-
-    return () => {
-      cancelled = true;
-    };
-  }, [calendarQuery.data, queryClient]);
 
   const searchQuery = search.trim().toLowerCase();
   const isSearching = !!searchQuery;
@@ -178,8 +164,17 @@ export default function CalendarPage() {
   async function refresh() {
     setRefreshing(true);
     try {
-      const next = await loadCalendar(true);
-      queryClient.setQueryData(["calendar"], next);
+      await refreshQueryDataIfChanged({
+        queryClient, queryKey: ["calendar"], refreshKey: "calendar",
+        currentData: queryClient.getQueryData<CalendarItem[]>(["calendar"]) ?? [],
+        refresh: async () => {
+          try { return await loadCalendar(true); }
+          catch (error) {
+            alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
+            throw error;
+          }
+        },
+      });
     } catch (error) {
       alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
     } finally {

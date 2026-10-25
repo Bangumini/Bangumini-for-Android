@@ -67,7 +67,6 @@ import type {
 } from "../../shared/sort-collections";
 import {
 	deleteCachedValue,
-	deleteCachedValuesByPrefix,
 	getPreferredSubjectCoverUrl,
 	readAllCachedCollections,
 	readCachedCollection,
@@ -103,7 +102,9 @@ import { useAlert } from "../../src/components/Dialog";
 import { refreshQueryDataIfChanged } from "../../src/api/stale-cache-refresh";
 import { readCachedQueryMap } from "../../src/api/query-map-cache";
 import { canRenderCachedCollectionsSnapshot } from "../../shared/collection-display";
-import { hasCollectionStateChanged } from "../../shared/collection-cache";
+import { mergeCollectionPatchIntoList, mergeConcurrentCollectionChanges, removeCollection } from "../../shared/collection-cache";
+import { useCacheRefreshPending } from "../../src/hooks/useCacheRefreshPending";
+import { isDetailPublication } from "../../src/hooks/subject-detail-loader";
 
 const CACHE_MAX_AGE = 1000 * 60 * 60 * 24;
 const AIRING_CACHE_PREFIX = "anilist-airing-v2-";
@@ -114,12 +115,14 @@ const CLOCK_EPSILON_MS = 1000;
 const PAGE_SIZE = 20;
 
 const EMPTY_COLLECTIONS: UserCollection[] = [];
+const EMPTY_CALENDAR: CalendarItem[] = [];
 const EMPTY_AIRING_MAP = new Map<number, number>();
 const EMPTY_AIRING_RECORD_MAP = new Map<number, AiringCacheRecord>();
 const EMPTY_EPISODE_LIST_MAP = new Map<number, Episode[]>();
 const EMPTY_SORTED_COLLECTIONS: SortedCollection[] = [];
 const EMPTY_DISPLAY_LABEL_MAP = new Map<number, string | null>();
 const EMPTY_SUBJECT_ID_SET = new Set<number>();
+const EMPTY_LOCAL_COLLECTIONS: ReadonlyMap<number, UserCollection | null> = new Map();
 
 type EpisodeScheduleCache = {
 	episodes: Episode[];
@@ -149,15 +152,29 @@ type CachedSnapshot<T> = {
 	complete: boolean;
 };
 
-type CommittedCollectionsState = {
-	scopeKey: string;
-	airingOffsetsVersion: string;
-	source: "cache" | "network";
-	version: string;
-	sorted: SortedCollection[];
-	displayLabelMap: Map<number, string | null>;
-	justUpdatedSubjectIds: Set<number>;
+type CollectionsDisplayInputs = {
+	collections: UserCollection[];
+	calendar: CalendarItem[];
+	episodes: Map<number, Episode[]>;
+	airingRecords: Map<number, AiringCacheRecord>;
 };
+
+type CommittedCollectionsState = { scopeKey: string; inputs: CollectionsDisplayInputs };
+type LocalCollectionRevision = { value: UserCollection | null; typeRevision: number; progressRevision: number };
+
+/** 本地读取结束后才放行网络，避免快响应抢在离线首屏前混入部分资源。 */
+function createLocalCacheGate(key: string) {
+	let release!: () => void;
+	let readers = 0;
+	const promise = new Promise<void>((resolve) => { release = resolve; });
+	return { key, promise, release, retain() {
+		readers += 1;
+		return () => {
+			readers -= 1;
+			queueMicrotask(() => { if (readers === 0) release(); });
+		};
+	} };
+}
 
 /** 分组 section（仅在看 tab 使用；跨页延续的组在后续页仍渲染组头） */
 interface CollectionSection {
@@ -213,11 +230,28 @@ async function delay(ms: number) {
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function lookupAiringTime(target: {
-	subjectId: number;
-	name: string;
-	nameCn: string;
-}) {
+type AiringTimeTarget = { subjectId: number; name: string; nameCn: string };
+const airingLookupsInFlight = new Map<number, ReturnType<typeof getAiringAt>>();
+function lookupAiringTime(target: AiringTimeTarget) {
+	const pending = airingLookupsInFlight.get(target.subjectId);
+	if (pending) return pending;
+	const task = lookupAiringTimeUncached(target).finally(() => airingLookupsInFlight.delete(target.subjectId));
+	airingLookupsInFlight.set(target.subjectId, task);
+	return task;
+}
+
+const episodeSchedulesInFlight = new Map<number, Promise<Episode[]>>();
+function fetchEpisodeSchedule(subjectId: number) {
+	const pending = episodeSchedulesInFlight.get(subjectId);
+	if (pending) return pending;
+	const task = Promise.resolve().then(() => getAllEpisodes(subjectId))
+		.then((data) => data.data.filter((episode) => episode.type === 0))
+		.finally(() => episodeSchedulesInFlight.delete(subjectId));
+	episodeSchedulesInFlight.set(subjectId, task);
+	return task;
+}
+
+async function lookupAiringTimeUncached(target: AiringTimeTarget) {
 	let result = await getAiringAt(target.name);
 	if (result.status !== "not_found") return result;
 
@@ -393,6 +427,7 @@ async function loadCollections(
 	type: CollectionType,
 	username: string,
 	force = false,
+	mergeResult?: (data: PagedResponse<UserCollection>) => Promise<PagedResponse<UserCollection>>,
 ) {
 	const cacheKey = `collections-${type}-${username}`;
 	if (!force) {
@@ -400,15 +435,27 @@ async function loadCollections(
 		if (cached) return cached.payload;
 	}
 
-	const data = await getAllUserCollections({ username, type });
-	await writeCachedValue(cacheKey, data);
-	await writeCachedSubjectPreviews(
-		data.data.map((collection) => collection.subject),
-	);
-	Promise.allSettled(
-		data.data.map((c) => writeCachedCollection(username, c)),
-	).catch(() => {});
-	return data;
+	const response = await getAllUserCollections({ username, type });
+	const data = { ...response, data: response.data.map((item) => ({ ...item, subject: { ...item.subject } })) };
+	await backfillCollectionTotals(data.data);
+	const result = mergeResult ? await mergeResult(data) : data;
+	// 乐观目标或 worker 新确认值不属于这次 GET 的服务端基础值，不能写回覆盖磁盘。
+	if (!hasLocalCollectionChanges(result, data)) {
+		await Promise.allSettled([
+			writeCachedValue(cacheKey, data),
+			writeCachedSubjectPreviews(data.data.map((collection) => collection.subject)),
+			...data.data.map((item) => writeCachedCollection(username, item)),
+		]);
+	}
+	return result;
+}
+
+async function backfillCollectionTotals(collections: UserCollection[]) {
+	await Promise.allSettled(collections.map(async (item) => {
+		if (item.subject.total_episodes || item.subject.eps) return;
+		const cached = await readCachedSubject(item.subject_id);
+		if (cached?.total_episodes || cached?.eps) item.subject.total_episodes = cached.total_episodes || cached.eps;
+	}));
 }
 
 async function mergeSubjectCollections(
@@ -522,15 +569,60 @@ function enrichCollections(
 	});
 }
 
+/** 固定完整的输入版本，只允许本地操作和时钟在该版本上投影。 */
+function projectCollectionsDisplay(
+	inputs: CollectionsDisplayInputs,
+	collectionType: CollectionType,
+	nowMs: number,
+	offsets: AiringOffsets,
+	localCollections: ReadonlyMap<number, UserCollection | null>,
+) {
+	const byId = new Map(inputs.collections.map((item) => [item.subject_id, item]));
+	for (const [id, local] of localCollections) {
+		if (!local || local.type !== collectionType) byId.delete(id);
+		else {
+			const base = byId.get(id);
+			byId.set(id, base ? { ...base, type: local.type, ep_status: local.ep_status } : local);
+		}
+	}
+	const raw = [...byId.values()].filter((item) => item.type === collectionType);
+	const collections = applyCollectionAiringOffsets(raw, offsets);
+	const calendar = applyCalendarAiringOffsets(inputs.calendar, offsets);
+	const observations = new Map<number, AiringObservation>();
+	for (const [id, record] of inputs.airingRecords) {
+		const observation = toAiringObservation(record);
+		if (observation) observations.set(id, observation);
+	}
+	const weekdays = new Map(getAiringMap(inputs.calendar));
+	for (const item of raw) {
+		if (!weekdays.has(item.subject_id) && item.subject.air_weekday) weekdays.set(item.subject_id, item.subject.air_weekday);
+	}
+	const derived = deriveAiringMaps(inputs.episodes, observations, weekdays, nowMs, offsets);
+	const sorted = sortCollections(collections, calendar, {
+		nowMs, airedEpMap: derived.airedEpMap, airingSignalMap: observations, nextAiringAtMap: derived.nextAiringAtMap,
+		airingStateOverrides: deriveManualAiringStates(raw, inputs.episodes, derived.airedEpMap, offsets),
+	});
+	const displayLabelMap = new Map(sorted.map((item) => [item.collection.subject_id,
+		getDisplayLabel(item.collection, item, { nowMs, nextAiringAtMap: derived.nextAiringAtMap })]));
+	return { sorted, displayLabelMap, justUpdatedSubjectIds: getJustUpdatedSubjectIds(sorted, derived.latestAiringAtMap, nowMs) };
+}
+
+function sameDisplayInputs(left: CollectionsDisplayInputs, right: CollectionsDisplayInputs) {
+	const encode = (key: string, value: unknown) => key === "fetchedAt" ? undefined
+		: value instanceof Map ? [...value].sort(([a], [b]) => Number(a) - Number(b)) : value;
+	return left === right || JSON.stringify(left, encode) === JSON.stringify(right, encode);
+}
+
 export default function CollectionsPage() {
 	const alert = useAlert();
 	const queryClient = useQueryClient();
 	const { checking, loggedIn, username } = useAuth();
 	const airingOffsets = useAiringOffsets();
-	const airingOffsetsVersion = JSON.stringify(airingOffsets);
 	const [collectionType, setCollectionType] = useState<CollectionType>(3);
 	const [search, setSearch] = useState("");
 	const [refreshing, setRefreshing] = useState(false);
+	const [manualRequestsDone, setManualRequestsDone] = useState(false);
+	const forceAiringRefreshRef = useRef(false);
 
 	useHeaderSearch({
 		value: search,
@@ -547,12 +639,30 @@ export default function CollectionsPage() {
 	const [cachedCalendarSnapshot, setCachedCalendarSnapshot] = useState<
 		CachedSnapshot<CalendarItem[]>
 	>({ key: "", value: null, version: 0, complete: false });
-	const [cachedEpisodeSnapshot, setCachedEpisodeSnapshot] = useState<
-		CachedSnapshot<Map<number, Episode[]>>
-	>({ key: "", value: null, version: 0, complete: false });
+	const [localCollectionState, setLocalCollectionState] = useState(() => ({
+		username, collections: EMPTY_LOCAL_COLLECTIONS,
+	}));
+	const localCollections = localCollectionState.username === username
+		? localCollectionState.collections : EMPTY_LOCAL_COLLECTIONS;
 	const [committedState, setCommittedState] =
 		useState<CommittedCollectionsState | null>(null);
-	const [backgroundRefreshCount, setBackgroundRefreshCount] = useState(0);
+	const shownInputsRef = useRef<CollectionsDisplayInputs | null>(null);
+	const localRevisionRef = useRef({ username, revision: 0, entries: new Map<number, LocalCollectionRevision>() });
+	if (localRevisionRef.current.username !== username) localRevisionRef.current = { username, revision: 0, entries: new Map() };
+	function mergeLatestCollections(data: PagedResponse<UserCollection>, liveData: PagedResponse<UserCollection>, originalData: PagedResponse<UserCollection>, revision: number) {
+		let next = mergeConcurrentCollectionChanges({ data, liveData, originalData, collectionType });
+		if (localRevisionRef.current.username !== username) return next;
+		for (const [id, local] of localRevisionRef.current.entries) {
+			if (Math.max(local.typeRevision, local.progressRevision) <= revision) continue;
+			if (!local.value) { next = removeCollection(next, id); continue; }
+			const patch = {
+				...(local.typeRevision > revision ? { type: local.value.type } : {}),
+				...(local.progressRevision > revision ? { ep_status: local.value.ep_status } : {}),
+			};
+			next = mergeCollectionPatchIntoList({ data: next, subjectId: id, patch, collectionType, fallbackCollection: local.value });
+		}
+		return next;
+	}
 	const airingRefreshGenerationRef = useRef(0);
 	const isMountedRef = useRef(true);
 	const syncClock = useCallback(() => setNowMs(Date.now()), []);
@@ -564,19 +674,30 @@ export default function CollectionsPage() {
 		};
 	}, []);
 
-	const trackBackgroundRefresh = useCallback(
-		(task: Promise<boolean> | null) => {
-			if (!task) return;
-			if (isMountedRef.current) {
-				setBackgroundRefreshCount((count) => count + 1);
-			}
-			void task.finally(() => {
-				if (!isMountedRef.current) return;
-				setBackgroundRefreshCount((count) => Math.max(0, count - 1));
-			});
-		},
-		[],
-	);
+	// 仅单条缓存代表用户/worker 的本地目标，列表网络响应不能借此提前发布。
+	useEffect(() => queryClient.getQueryCache().subscribe((event) => {
+		if (isDetailPublication(queryClient) || event.type !== "updated" || event.action.type !== "success") return;
+		const [kind, account, id] = event.query.queryKey;
+		if (kind !== "collection" || account !== username || typeof id !== "number") return;
+		const value = event.query.state.data as UserCollection | null | undefined;
+		if (value === undefined) return;
+		const revisions = localRevisionRef.current;
+		const oldRevision = revisions.entries.get(id);
+		const before = oldRevision ? oldRevision.value : shownInputsRef.current?.collections.find((item) => item.subject_id === id);
+		const typeChanged = before?.type !== value?.type;
+		const progressChanged = before?.ep_status !== value?.ep_status;
+		if (!typeChanged && !progressChanged) return;
+		const revision = ++revisions.revision;
+		revisions.entries.set(id, { value,
+			typeRevision: typeChanged ? revision : oldRevision?.typeRevision ?? 0,
+			progressRevision: progressChanged ? revision : oldRevision?.progressRevision ?? 0 });
+		setLocalCollectionState((state) => {
+			const previous = state.username === username ? state.collections : EMPTY_LOCAL_COLLECTIONS;
+			const old = previous.get(id);
+			if (previous.has(id) && old?.type === value?.type && old?.ep_status === value?.ep_status) return state;
+			return { username, collections: new Map(previous).set(id, value) };
+		});
+	}), [queryClient, username]);
 
 	useEffect(() => {
 		const subscription = AppState.addEventListener("change", (state) => {
@@ -617,16 +738,28 @@ export default function CollectionsPage() {
 	}, [checking, loggedIn, queryClient]);
 
 	const collectionsCacheKey = `collections-${collectionType}-${username}`;
+	const isWatching = collectionType === 3;
+	const backgroundRefreshKeys = useMemo(() => isWatching
+		? [collectionsCacheKey, "calendar"] : [collectionsCacheKey], [collectionsCacheKey, isWatching]);
+	const isBackgroundRefreshing = useCacheRefreshPending(queryClient, backgroundRefreshKeys);
+	const [localCacheGate, setLocalCacheGate] = useState(() => createLocalCacheGate(collectionsCacheKey));
+	if (localCacheGate.key !== collectionsCacheKey) setLocalCacheGate(createLocalCacheGate(collectionsCacheKey));
+	useEffect(() => localCacheGate.retain(), [localCacheGate]);
 	const collectionsQueryKey = [
 		"collections",
 		collectionType,
 		username,
 	] as const;
+	const entryCollections = useRef({ key: collectionsCacheKey, available: queryClient.getQueryData(collectionsQueryKey) !== undefined });
+	if (entryCollections.current.key !== collectionsCacheKey) entryCollections.current = {
+		key: collectionsCacheKey, available: queryClient.getQueryData(collectionsQueryKey) !== undefined,
+	};
 	const collectionsQuery = useQuery({
 		queryKey: collectionsQueryKey,
 		enabled: loggedIn && !!username,
 		queryFn: async () => {
 			const initialData = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey);
+			const initialRevision = localRevisionRef.current.revision;
 			const mergeResult = async (
 				data: PagedResponse<UserCollection>,
 				preferMemory = false,
@@ -635,18 +768,20 @@ export default function CollectionsPage() {
 				const tasks = await getCollectionTaskQueue();
 				// SQLite 和队列读取期间 worker 可能完成；连捕获的任务投影也不能盖过新内存。
 				const liveData = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey);
-				if (liveData !== undefined && liveData !== requestData) return liveData;
-				return mergePendingCollectionTasks({
-					data: preferMemory ? liveData ?? data : data,
-					currentData: liveData,
-					tasks,
-					username,
-					collectionType,
+				const merged = mergePendingCollectionTasks({
+					data: preferMemory ? liveData ?? data : data, currentData: liveData,
+					tasks, username, collectionType,
 				});
+				if (preferMemory && liveData !== undefined && liveData !== requestData) return liveData;
+				return mergeLatestCollections(merged, liveData ?? merged, requestData ?? merged, initialRevision);
 			};
 			const cached = await readCachedCollections(collectionType, username);
 			if (cached) {
-				const cachedPayload = await mergeResult(cached.payload, true);
+				const merged = await mergeResult(cached.payload, true);
+				const hydrated = { ...merged, data: merged.data.map((item) => ({ ...item, subject: { ...item.subject } })) };
+				await backfillCollectionTotals(hydrated.data);
+				const live = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey);
+				const cachedPayload = live !== undefined && live !== initialData ? live : hydrated;
 				if (isMountedRef.current) {
 					setCachedCollectionsSnapshot({
 						key: collectionsCacheKey,
@@ -655,21 +790,19 @@ export default function CollectionsPage() {
 						complete: true,
 					});
 				}
-				// 已与 worker 的提交相撞时直接复用确认值，不能紧接着再用旧请求链发起整表回源。
-				const changedDuringRead = queryClient.getQueryData(collectionsQueryKey) !== initialData;
-				const refreshTask = changedDuringRead ? null : refreshQueryDataIfChanged({
+				const refreshTask = refreshQueryDataIfChanged({
 					queryClient,
 					queryKey: collectionsQueryKey,
 					refreshKey: collectionsCacheKey,
 					currentData: cachedPayload,
 					refresh: async () => {
-						// 后台请求以这次缓存结果为基线，不能把 queryFn 自己的首屏提交误认成本地修改。
-						const beforeRefresh = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey) ?? cachedPayload;
-						return mergeResult(await loadCollections(collectionType, username, true), false, beforeRefresh);
+						// 比较请求起点的收藏字段；离线首屏自身换引用不算新操作，但读取期间的 worker 提交必须保留。
+						await localCacheGate.promise;
+						return loadCollections(collectionType, username, true, (data) => mergeResult(data, false, initialData ?? cachedPayload));
 					},
-					hasLocalChanges: hasLocalCollectionChanges,
+					mergeLatest: (data, liveData, originalData) => mergeLatestCollections(data, liveData, originalData, initialRevision),
 				});
-				trackBackgroundRefresh(refreshTask);
+				void refreshTask;
 				return cachedPayload;
 			}
 
@@ -681,7 +814,8 @@ export default function CollectionsPage() {
 					complete: false,
 				});
 			}
-			return mergeResult(await loadCollections(collectionType, username, true));
+			await localCacheGate.promise;
+			return loadCollections(collectionType, username, true, (data) => mergeResult(data));
 		},
 	});
 
@@ -704,9 +838,9 @@ export default function CollectionsPage() {
 					queryKey: ["calendar"],
 					refreshKey: "calendar",
 					currentData: cached.payload,
-					refresh: () => loadCalendar(true),
+					refresh: async () => { await localCacheGate.promise; return loadCalendar(true); },
 				});
-				trackBackgroundRefresh(refreshTask);
+				void refreshTask;
 				return cached.payload;
 			}
 
@@ -718,19 +852,20 @@ export default function CollectionsPage() {
 					complete: false,
 				});
 			}
+			await localCacheGate.promise;
 			return loadCalendar(true);
 		},
 	});
 
 	const airingMap = useMemo(
-		() => getAiringMap(calendarQuery.data),
-		[calendarQuery.data],
+		() => getAiringMap(calendarQuery.data ?? (cachedCalendarSnapshot.key === "calendar" ? cachedCalendarSnapshot.value ?? undefined : undefined)),
+		[calendarQuery.data, cachedCalendarSnapshot],
 	);
 	const searchQuery = search.trim().toLowerCase();
 
 	const sourceCollections = useMemo(
-		() => collectionsQuery.data?.data ?? [],
-		[collectionsQuery.data?.data],
+		() => collectionsQuery.data?.data ?? (cachedCollectionsSnapshot.key === collectionsCacheKey ? cachedCollectionsSnapshot.value?.data : undefined) ?? EMPTY_COLLECTIONS,
+		[collectionsQuery.data?.data, cachedCollectionsSnapshot, collectionsCacheKey],
 	);
 	const visibleCollectionTasks = useMemo(() => {
 		const tasks = username
@@ -756,7 +891,6 @@ export default function CollectionsPage() {
 				.filter((collection) => collection.type === collectionType),
 		[sourceCollections, visibleCollectionTasks, collectionType],
 	);
-	const isWatching = collectionType === 3;
 	const scheduleWeekdayMap = useMemo(() => {
 		const map = new Map(airingMap);
 		for (const item of rawCollections) {
@@ -771,7 +905,8 @@ export default function CollectionsPage() {
 	// --- Phase 1: Backfill total_episodes from SQLite cache ---
 	const {
 		data: totalEpBackfill,
-		dataUpdatedAt: totalEpBackfillUpdatedAt,
+		isFetched: totalEpBackfillFetched,
+		isError: totalEpBackfillError,
 	} = useQuery({
 		queryKey: [
 			"totalep-backfill",
@@ -806,20 +941,22 @@ export default function CollectionsPage() {
 
 	const {
 		data: episodeTotals,
-		dataUpdatedAt: episodeTotalsUpdatedAt,
+		isFetching: isEpisodeTotalsFetching,
+		isFetched: episodeTotalsFetched,
+		isError: episodeTotalsError,
 	} = useQuery({
 		queryKey: ["episode-totals", subjectsNeedingEpisodes.join(",")],
 		queryFn: async () => {
 			if (subjectsNeedingEpisodes.length === 0) return new Map<number, number>();
 			const totals = new Map<number, number>();
 
+			await localCacheGate.promise;
 			// Batch fetch (10 at a time to avoid rate limiting)
 			for (let i = 0; i < subjectsNeedingEpisodes.length; i += 10) {
 				const batch = subjectsNeedingEpisodes.slice(i, i + 10);
 				const results = await Promise.allSettled(
 					batch.map((id) =>
-						getAllEpisodes(id).then((data) => {
-							const mainEps = data.data.filter((ep) => ep.type === 0);
+						fetchEpisodeSchedule(id).then((mainEps) => {
 							return { id, totalEp: mainEps.length };
 						}),
 					),
@@ -902,7 +1039,7 @@ export default function CollectionsPage() {
 	const {
 		data: cachedAiringRecordMap,
 		isFetched: cachedAiringTimeFetched,
-		dataUpdatedAt: cachedAiringTimeUpdatedAt,
+		isError: cachedAiringTimeError,
 	} = useQuery({
 		queryKey: ["anilist-airing-times-cache-v2", airingTimeCacheKey],
 		queryFn: () => readCachedAiringRecords(airingTimeCacheIds),
@@ -948,13 +1085,13 @@ export default function CollectionsPage() {
 		data: airingRecordMapData,
 		isFetching: isAiringTimeFetching,
 		isError: isAiringTimeError,
-		dataUpdatedAt: airingTimeUpdatedAt,
+		isFetched: airingTimeFetched,
 	} = useQuery({
 		queryKey: ["anilist-airing-times-v2", airingTimeTargetKey],
 		placeholderData: knownTargetAiringRecords,
 		queryFn: async () => {
 			const generation = airingRefreshGenerationRef.current;
-			const persistedRecords = await readCachedAiringRecords(airingTimeCacheIds);
+			const persistedRecords = cachedAiringRecordMap ?? EMPTY_AIRING_RECORD_MAP;
 			const map = readCachedQueryMap<AiringCacheRecord>(
 				queryClient,
 				[["anilist-airing-times-cache-v2"], ["anilist-airing-times-v2"]],
@@ -968,8 +1105,9 @@ export default function CollectionsPage() {
 					}
 				}
 			}
+			await localCacheGate.promise;
 			const targetsToRefresh = airingTimeTargets.filter((target) =>
-				shouldRefreshAiringRecord(map.get(target.subjectId), Date.now()),
+				forceAiringRefreshRef.current || shouldRefreshAiringRecord(map.get(target.subjectId), Date.now()),
 			);
 			for (const [index, target] of targetsToRefresh.entries()) {
 				if (generation !== airingRefreshGenerationRef.current) return map;
@@ -1028,11 +1166,39 @@ export default function CollectionsPage() {
 		),
 		[queryClient, allEpisodeIds],
 	);
+	// 本地读取有独立的 Query 生命周期，网络挂起后切页返回仍能取到完整离线初版。
+	const { data: cachedEpisodeRecords, isFetched: cachedEpisodeFetched, isError: cachedEpisodeError } = useQuery({
+		queryKey: ["episodes-schedule-local-v2", episodeQuerySourceKey],
+		queryFn: () => readCachedValuesAllowStale<unknown>(allEpisodeIds.map(getEpisodeCacheKey)),
+		enabled: isWatching && allEpisodeIds.length > 0,
+		staleTime: EPISODES_CACHE_MAX_AGE,
+		gcTime: CACHE_MAX_AGE * 2,
+	});
+	const cachedEpisodeSnapshot = useMemo<CachedSnapshot<Map<number, Episode[]>>>(() => {
+		const value = new Map(knownEpisodeLists);
+		let version = 0;
+		for (const id of allEpisodeIds) {
+			const record = cachedEpisodeRecords?.get(getEpisodeCacheKey(id));
+			if (isEpisodeScheduleCache(record)) {
+				mergeEpisodeScheduleRecord(value, id, record);
+				version = Math.max(version, record.checkedAt);
+			}
+			if (!value.has(id)) {
+				const detail = queryClient.getQueryData<PagedResponse<Episode>>(["episodes", id]);
+				if (detail) {
+					const episodes = detail.data.filter((item) => item.type === 0);
+					mergeEpisodeScheduleRecord(value, id, { episodes, checkedAt: queryClient.getQueryState(["episodes", id])?.dataUpdatedAt ?? 0 });
+				}
+			}
+		}
+		return { key: cachedEpisodeFetched || cachedEpisodeError ? episodeQuerySourceKey : "", value,
+			version, complete: allEpisodeIds.every((id) => value.has(id)) };
+	}, [queryClient, knownEpisodeLists, allEpisodeIds, cachedEpisodeRecords, cachedEpisodeFetched, cachedEpisodeError, episodeQuerySourceKey]);
 	const {
 		data: episodeListMapData,
 		isFetching: isEpisodeFetching,
 		isError: isEpisodeError,
-		dataUpdatedAt: episodeUpdatedAt,
+		isFetched: episodeFetched,
 	} = useQuery({
 		queryKey: ["episodes-schedule-v2", episodeQuerySourceKey],
 		placeholderData: knownEpisodeLists,
@@ -1044,7 +1210,7 @@ export default function CollectionsPage() {
 			const cachedRecords = new Map<number, EpisodeScheduleCache>();
 			const idsToFetch: number[] = [];
 			const invalidCacheKeys: string[] = [];
-			const cachedByKey = await readCachedValuesAllowStale<unknown>(
+			const cachedByKey = cachedEpisodeRecords ?? await readCachedValuesAllowStale<unknown>(
 				allEpisodeIds.map(getEpisodeCacheKey),
 			);
 			const checkedAt = Date.now();
@@ -1056,7 +1222,7 @@ export default function CollectionsPage() {
 				}
 				if (isEpisodeScheduleCache(cached)) {
 					cachedRecords.set(id, cached);
-					if (checkedAt - cached.checkedAt <= EPISODES_CACHE_MAX_AGE) {
+					if (!forceAiringRefreshRef.current && checkedAt - cached.checkedAt <= EPISODES_CACHE_MAX_AGE) {
 						mergeEpisodeScheduleRecord(map, id, cached);
 						continue;
 					}
@@ -1069,29 +1235,12 @@ export default function CollectionsPage() {
 				);
 			}
 
-			// 旧但格式兼容的 v2 缓存可立即用于首屏；新鲜度只决定是否后台回源。
-			if (isMountedRef.current) {
-				const cachedEpisodeListMap = new Map<number, Episode[]>(map);
-				for (const [id, cached] of cachedRecords) {
-					mergeEpisodeScheduleRecord(cachedEpisodeListMap, id, cached);
-				}
-				setCachedEpisodeSnapshot({
-					key: episodeQuerySourceKey,
-					value: cachedEpisodeListMap,
-					version: Math.max(
-						0,
-						...Array.from(cachedRecords.values(), (cached) => cached.checkedAt),
-					),
-					complete: cachedRecords.size === allEpisodeIds.length,
-				});
-			}
+			await localCacheGate.promise;
 
 			const results = await Promise.allSettled(
 				idsToFetch.map(async (id) => ({
 					id,
-					episodes: (await getAllEpisodes(id)).data.filter(
-						(episode) => episode.type === 0,
-					),
+					episodes: await fetchEpisodeSchedule(id),
 				})),
 			);
 			for (let index = 0; index < results.length; index += 1) {
@@ -1116,7 +1265,7 @@ export default function CollectionsPage() {
 			}
 			return map;
 		},
-		enabled: isWatching && allEpisodeIds.length > 0,
+		enabled: isWatching && allEpisodeIds.length > 0 && (cachedEpisodeFetched || cachedEpisodeError),
 		staleTime: EPISODES_CACHE_MAX_AGE,
 		gcTime: CACHE_MAX_AGE * 2,
 	});
@@ -1133,7 +1282,6 @@ export default function CollectionsPage() {
 			),
 		[episodeListMap, airingObservationMap, scheduleWeekdayMap, nowMs, airingOffsets],
 	);
-	const episodeMap = derivedAiringData.airedEpMap;
 	const nextAiringAtMap = derivedAiringData.nextAiringAtMap;
 	const latestAiringAtMap = derivedAiringData.latestAiringAtMap;
 
@@ -1175,337 +1323,98 @@ export default function CollectionsPage() {
 		syncClock,
 	]);
 
-	// --- Merge all data sources ---
-	const enrichedCollections = useMemo(
-		() => enrichCollections(rawCollections, totalEpBackfill, episodeTotals),
-		[rawCollections, totalEpBackfill, episodeTotals],
-	);
-
-	const effectiveCollections = useMemo(
-		() => applyCollectionAiringOffsets(enrichedCollections, airingOffsets),
-		[enrichedCollections, airingOffsets],
-	);
-	const effectiveCalendar = useMemo(
-		() => applyCalendarAiringOffsets(calendarQuery.data ?? [], airingOffsets),
-		[calendarQuery.data, airingOffsets],
-	);
-
-	// 这组数据代表当前 React Query 状态；只有在缓存快照或完整网络状态就绪后才提交到 UI。
-	const sortedCollections = useMemo(
-		() =>
-			sortCollections(effectiveCollections, effectiveCalendar, {
-				nowMs,
-				airedEpMap: episodeMap,
-				airingSignalMap: airingObservationMap,
-				nextAiringAtMap,
-				airingStateOverrides: deriveManualAiringStates(enrichedCollections, episodeListMap, episodeMap, airingOffsets),
-			}),
-		[
-			effectiveCollections,
-			effectiveCalendar,
-			enrichedCollections,
-			episodeListMap,
-			airingOffsets,
-			nowMs,
-			episodeMap,
-			airingObservationMap,
-			nextAiringAtMap,
-		],
-	);
-	const sortedJustUpdatedSubjectIds = useMemo(
-		() => getJustUpdatedSubjectIds(sortedCollections, latestAiringAtMap, nowMs),
-		[sortedCollections, latestAiringAtMap, nowMs],
-	);
-	const sortedDisplayLabelMap = useMemo(() => {
-		const map = new Map<number, string | null>();
-		for (const sc of sortedCollections) {
-			map.set(
-				sc.collection.subject_id,
-				getDisplayLabel(
-					sc.collection,
-					{ group: sc.group, weekday: sc.weekday, airedEp: sc.airedEp },
-					{ nowMs, nextAiringAtMap },
-				),
-			);
-		}
-		return map;
-	}, [sortedCollections, nowMs, nextAiringAtMap]);
-
-	// --- Local v2 cache snapshot ---
-	const hasCollectionsSnapshot =
-		cachedCollectionsSnapshot.key === collectionsCacheKey &&
-		cachedCollectionsSnapshot.complete &&
-		cachedCollectionsSnapshot.value !== null;
-	// SQLite 仅补齐首屏缺失数据，不能覆盖内存中更新的任务投影或服务端确认值。
-	const cacheCollectionsData = collectionsQuery.data ?? (
-		hasCollectionsSnapshot ? cachedCollectionsSnapshot.value : null
-	);
-	const cacheRawCollections = useMemo(() => {
-		const source = cacheCollectionsData?.data ?? EMPTY_COLLECTIONS;
-		return source
-			.map((collection) => {
-				const patch = getOptimisticCollectionPatchForSubject(
-					collection.subject_id,
-					visibleCollectionTasks,
-				);
-				return patch ? { ...collection, ...patch } : collection;
-			})
-			.filter((collection) => collection.type === collectionType);
-	}, [cacheCollectionsData, collectionType, visibleCollectionTasks]);
-	const cacheCalendar = useMemo(() => {
-		if (calendarQuery.data !== undefined) return calendarQuery.data;
-		if (
-			cachedCalendarSnapshot.key === "calendar" &&
-			cachedCalendarSnapshot.complete
-		) {
-			return cachedCalendarSnapshot.value ?? [];
-		}
-		return calendarQuery.data ?? [];
-	}, [cachedCalendarSnapshot, calendarQuery.data]);
-	const cacheAiringMap = useMemo(() => getAiringMap(cacheCalendar), [cacheCalendar]);
-	const cacheAiringObservationMap = airingObservationMap;
-	const cacheEpisodeListMap = episodeListMapData ?? (
-		cachedEpisodeSnapshot.key === episodeQuerySourceKey
-			? cachedEpisodeSnapshot.value
-			: null
-	) ?? EMPTY_EPISODE_LIST_MAP;
-	const cacheDerivedAiringData = useMemo(
-		() =>
-			deriveAiringMaps(
-				cacheEpisodeListMap,
-				cacheAiringObservationMap,
-				cacheAiringMap,
-				nowMs,
-				airingOffsets,
-			),
-		[cacheEpisodeListMap, cacheAiringObservationMap, cacheAiringMap, nowMs, airingOffsets],
-	);
-	const cacheEnrichedCollections = useMemo(
-		() => enrichCollections(cacheRawCollections, totalEpBackfill),
-		[cacheRawCollections, totalEpBackfill],
-	);
-	const cacheEffectiveCollections = useMemo(
-		() => applyCollectionAiringOffsets(cacheEnrichedCollections, airingOffsets),
-		[cacheEnrichedCollections, airingOffsets],
-	);
-	const cacheEffectiveCalendar = useMemo(
-		() => applyCalendarAiringOffsets(cacheCalendar, airingOffsets),
-		[cacheCalendar, airingOffsets],
-	);
-	const cacheSortedCollections = useMemo(
-		() =>
-			sortCollections(cacheEffectiveCollections, cacheEffectiveCalendar, {
-				nowMs,
-				airedEpMap: cacheDerivedAiringData.airedEpMap,
-				airingSignalMap: cacheAiringObservationMap,
-				nextAiringAtMap: cacheDerivedAiringData.nextAiringAtMap,
-				airingStateOverrides: deriveManualAiringStates(cacheEnrichedCollections, cacheEpisodeListMap, cacheDerivedAiringData.airedEpMap, airingOffsets),
-			}),
-		[
-			cacheEffectiveCollections,
-			cacheEffectiveCalendar,
-			cacheEnrichedCollections,
-			cacheEpisodeListMap,
-			airingOffsets,
-			nowMs,
-			cacheDerivedAiringData.airedEpMap,
-			cacheAiringObservationMap,
-			cacheDerivedAiringData.nextAiringAtMap,
-		],
-	);
-	const cacheJustUpdatedSubjectIds = useMemo(
-		() =>
-			getJustUpdatedSubjectIds(
-				cacheSortedCollections,
-				cacheDerivedAiringData.latestAiringAtMap,
-				nowMs,
-			),
-		[cacheSortedCollections, cacheDerivedAiringData.latestAiringAtMap, nowMs],
-	);
-	const cacheDisplayLabelMap = useMemo(() => {
-		const map = new Map<number, string | null>();
-		for (const sc of cacheSortedCollections) {
-			map.set(
-				sc.collection.subject_id,
-				getDisplayLabel(
-					sc.collection,
-					{ group: sc.group, weekday: sc.weekday, airedEp: sc.airedEp },
-					{
-						nowMs,
-						nextAiringAtMap: cacheDerivedAiringData.nextAiringAtMap,
-					},
-				),
-			);
-		}
-		return map;
-	}, [
-		cacheSortedCollections,
-		nowMs,
-		cacheDerivedAiringData.nextAiringAtMap,
-	]);
-
-	const hasCachedCollections = hasCollectionsSnapshot || collectionsQuery.data !== undefined;
-	const shouldLoadEpisodes = isWatching && allEpisodeIds.length > 0;
+	// 本地读取结束便可发布一次初版；其后内部缓存变化不能直接改变展示输入。
+	const hasCollectionsSnapshot = cachedCollectionsSnapshot.key === collectionsCacheKey &&
+		cachedCollectionsSnapshot.complete && cachedCollectionsSnapshot.value !== null;
+	const cacheCollectionsData = collectionsQuery.data ?? (hasCollectionsSnapshot ? cachedCollectionsSnapshot.value : null);
+	const cacheCalendar = calendarQuery.data ?? (cachedCalendarSnapshot.key === "calendar" ? cachedCalendarSnapshot.value : null) ?? EMPTY_CALENDAR;
+	const cacheEpisodeListMap = cachedEpisodeSnapshot.value ?? EMPTY_EPISODE_LIST_MAP;
+	const hasMissingTotals = rawCollections.some((item) => !item.subject.total_episodes && !item.subject.eps);
+	const localCacheReady =
+		(cachedCollectionsSnapshot.key === collectionsCacheKey || collectionsQuery.data !== undefined || collectionsQuery.isError) &&
+		(!isWatching || cachedCalendarSnapshot.key === "calendar" || calendarQuery.data !== undefined || calendarQuery.isError) &&
+		(!shouldReadAiringTimeCache || cachedAiringTimeFetched || cachedAiringTimeError) &&
+		(!isWatching || allEpisodeIds.length === 0 || cachedEpisodeFetched || cachedEpisodeError) &&
+		(!hasMissingTotals || totalEpBackfillFetched || totalEpBackfillError);
+	useEffect(() => { if (localCacheReady) localCacheGate.release(); }, [localCacheReady, localCacheGate]);
 	const canCommitCacheSnapshot = canRenderCachedCollectionsSnapshot({
-		username,
-		hasCachedCollections,
-	});
-
-	const isDisplayDependencyError =
-		(!collectionsQuery.data && collectionsQuery.isError) ||
-		(isWatching && !calendarQuery.data && calendarQuery.isError) ||
-		(isWatching && !airingRecordMapData && isAiringTimeError) ||
-		(isWatching && !episodeListMapData && isEpisodeError);
-	const isDisplayDataAvailable =
-		Boolean(username) &&
-		collectionsQuery.data !== undefined &&
-		(!isWatching || calendarQuery.data !== undefined) &&
-		(!shouldReadAiringTimeCache || cachedAiringRecordMap !== undefined) &&
-		(!shouldLoadAiringTimes || airingRecordMapData !== undefined) &&
-		(!shouldLoadEpisodes || episodeListMapData !== undefined);
+		username, hasCachedCollections: hasCollectionsSnapshot || entryCollections.current.available,
+	}) && localCacheReady;
+	const cacheInputs = useMemo<CollectionsDisplayInputs>(() => ({
+		collections: enrichCollections(cacheCollectionsData?.data ?? EMPTY_COLLECTIONS, totalEpBackfill,
+			new Map([...cacheEpisodeListMap].map(([id, list]) => [id, list.length]))),
+		calendar: cacheCalendar, episodes: cacheEpisodeListMap, airingRecords: airingRecordMap,
+	}), [cacheCollectionsData, cacheCalendar, cacheEpisodeListMap, totalEpBackfill, airingRecordMap]);
+	const liveInputs = useMemo<CollectionsDisplayInputs>(() => ({
+		collections: enrichCollections(sourceCollections, totalEpBackfill, episodeTotals),
+		calendar: calendarQuery.data ?? cacheCalendar,
+		episodes: episodeListMapData ?? cacheEpisodeListMap, airingRecords: airingRecordMap,
+	}), [sourceCollections, totalEpBackfill, episodeTotals, calendarQuery.data, cacheCalendar, episodeListMapData, cacheEpisodeListMap, airingRecordMap]);
+	const shouldLoadEpisodes = isWatching && allEpisodeIds.length > 0;
 	const isDisplayNetworkIdle =
-		backgroundRefreshCount === 0 &&
-		!collectionsQuery.isFetching &&
-		(!isWatching || !calendarQuery.isFetching) &&
-		(!shouldLoadAiringTimes || !isAiringTimeFetching) &&
-		(!shouldLoadEpisodes || !isEpisodeFetching);
-	const isDisplayReady =
-		isDisplayDataAvailable && isDisplayNetworkIdle && !isDisplayDependencyError;
+		localCacheReady && !isBackgroundRefreshing &&
+		!collectionsQuery.isFetching && (!isWatching || !calendarQuery.isFetching) &&
+		(!shouldLoadAiringTimes || ((airingTimeFetched || isAiringTimeError) && !isAiringTimeFetching)) &&
+		(!shouldLoadEpisodes || ((episodeFetched || isEpisodeError) && !isEpisodeFetching)) &&
+		(subjectsNeedingEpisodes.length === 0 || ((episodeTotalsFetched || episodeTotalsError) && !isEpisodeTotalsFetching));
+	useEffect(() => {
+		if (manualRequestsDone && isDisplayNetworkIdle) {
+			forceAiringRefreshRef.current = false;
+			setManualRequestsDone(false);
+			setRefreshing(false);
+		}
+	}, [manualRequestsDone, isDisplayNetworkIdle]);
+	const isDisplayReady = Boolean(username) && !refreshing && isDisplayNetworkIdle &&
+		(collectionsQuery.data !== undefined || hasCollectionsSnapshot) &&
+		(!isWatching || calendarQuery.data !== undefined || calendarQuery.isError);
 	const committedScopeKey = `${username}:${collectionType}`;
-	const cacheCommittedVersion = [
-		committedScopeKey,
-		airingOffsetsVersion,
-		cachedCollectionsSnapshot.version,
-		cachedCalendarSnapshot.version,
-		cachedEpisodeSnapshot.version,
-		cachedAiringTimeUpdatedAt,
-		totalEpBackfillUpdatedAt,
-		episodeTotalsUpdatedAt,
-		nowMs,
-		"cache",
-	].join("|");
-	const committedVersion = [
-		committedScopeKey,
-		airingOffsetsVersion,
-		collectionsQuery.dataUpdatedAt,
-		calendarQuery.dataUpdatedAt,
-		cachedAiringTimeUpdatedAt,
-		airingTimeUpdatedAt,
-		episodeUpdatedAt,
-		totalEpBackfillUpdatedAt,
-		episodeTotalsUpdatedAt,
-		nowMs,
-		"network",
-	].join("|");
 
 	useEffect(() => {
-		if (!username) {
-			setCommittedState(null);
-			return;
-		}
+		if (!username) { setCommittedState(null); return; }
 		if (!isDisplayReady && !canCommitCacheSnapshot) return;
-
-		const useSettledData = isDisplayReady;
-		const nextVersion = useSettledData
-			? committedVersion
-			: cacheCommittedVersion;
-		const nextSorted = useSettledData
-			? sortedCollections
-			: cacheSortedCollections;
-		const nextDisplayLabelMap = useSettledData
-			? sortedDisplayLabelMap
-			: cacheDisplayLabelMap;
-		const nextJustUpdatedSubjectIds = useSettledData
-			? sortedJustUpdatedSubjectIds
-			: cacheJustUpdatedSubjectIds;
-
+		const inputs = isDisplayReady ? liveInputs : cacheInputs;
 		setCommittedState((previous) => {
-			// 网络刷新期间保留已经提交的新鲜快照，避免闪回到不完整缓存。
-			if (
-				!useSettledData &&
-				previous?.scopeKey === committedScopeKey &&
-				previous.airingOffsetsVersion === airingOffsetsVersion &&
-				previous.source === "network"
-			) {
-				return previous;
+			if (previous?.scopeKey === committedScopeKey) {
+				// 整轮未结束时，不论来自缓存还是网络，都不得逐项解冻旧快照。
+				if (!isDisplayReady || sameDisplayInputs(previous.inputs, inputs)) return previous;
 			}
-			if (
-				previous?.scopeKey === committedScopeKey &&
-				previous.version === nextVersion &&
-				previous.sorted === nextSorted &&
-				previous.displayLabelMap === nextDisplayLabelMap &&
-				previous.justUpdatedSubjectIds === nextJustUpdatedSubjectIds
-			) {
-				return previous;
-			}
-			return {
-				scopeKey: committedScopeKey,
-				airingOffsetsVersion,
-				source: useSettledData ? "network" : "cache",
-				version: nextVersion,
-				sorted: nextSorted,
-				displayLabelMap: nextDisplayLabelMap,
-				justUpdatedSubjectIds: nextJustUpdatedSubjectIds,
-			};
+			return { scopeKey: committedScopeKey, inputs };
 		});
-	}, [
-		airingOffsetsVersion,
-		cacheCommittedVersion,
-		cacheDisplayLabelMap,
-		cacheJustUpdatedSubjectIds,
-		cacheSortedCollections,
-		canCommitCacheSnapshot,
-		committedScopeKey,
-		committedVersion,
-		isDisplayReady,
-		sortedCollections,
-		sortedDisplayLabelMap,
-		sortedJustUpdatedSubjectIds,
-		username,
-	]);
+		if (isDisplayReady) {
+			setLocalCollectionState((state) => {
+				if (state.username !== username) return state;
+				const byId = new Map(inputs.collections.map((item) => [item.subject_id, item]));
+				const remaining = new Map([...state.collections].filter(([id, local]) => {
+					const base = byId.get(id);
+					return local?.type === collectionType
+						? !base || base.type !== local.type || base.ep_status !== local.ep_status
+						: base !== undefined;
+				}));
+				return remaining.size === state.collections.size ? state : { ...state, collections: remaining };
+			});
+		}
+	}, [username, committedScopeKey, collectionType, isDisplayReady, canCommitCacheSnapshot, cacheInputs, liveInputs]);
 
-	const localFallbackState: CommittedCollectionsState | null =
-		canCommitCacheSnapshot
-			? {
-					scopeKey: committedScopeKey,
-					airingOffsetsVersion,
-					source: "cache",
-					version: cacheCommittedVersion,
-					sorted: cacheSortedCollections,
-					displayLabelMap: cacheDisplayLabelMap,
-					justUpdatedSubjectIds: cacheJustUpdatedSubjectIds,
-				}
-			: null;
-	// 本地偏置保存后立即重算，不沿用仍在等待网络的偏置前快照。
-	const committedForScope =
-		committedState?.scopeKey === committedScopeKey &&
-		committedState.airingOffsetsVersion === airingOffsetsVersion
-			? committedState
-			: null;
-	// 提交门只稳定排期等辅助刷新，不能阻塞用户意图（进度、收藏类型和列表成员）的变化。
-	const shouldShowLiveCollectionState =
-		isDisplayDataAvailable &&
-		committedForScope?.source === "network" &&
-		hasCollectionStateChanged(committedForScope.sorted, sortedCollections);
-	const activeCommittedState: CommittedCollectionsState | null =
-		shouldShowLiveCollectionState
-			? {
-					scopeKey: committedScopeKey,
-					airingOffsetsVersion,
-					source: "network",
-					version: committedVersion,
-					sorted: sortedCollections,
-					displayLabelMap: sortedDisplayLabelMap,
-					justUpdatedSubjectIds: sortedJustUpdatedSubjectIds,
-				}
-			: committedForScope?.source === "network"
-				? committedForScope
-				: (localFallbackState ?? committedForScope);
-	const visibleSorted = activeCommittedState?.sorted ?? EMPTY_SORTED_COLLECTIONS;
-	const visibleDisplayLabelMap =
-		activeCommittedState?.displayLabelMap ?? EMPTY_DISPLAY_LABEL_MAP;
-	const visibleJustUpdatedSubjectIds =
-		activeCommittedState?.justUpdatedSubjectIds ?? EMPTY_SUBJECT_ID_SET;
+	const activeInputs = committedState?.scopeKey === committedScopeKey ? committedState.inputs
+		: canCommitCacheSnapshot ? cacheInputs : null;
+	shownInputsRef.current = activeInputs;
+	const userCollections = useMemo(() => {
+		const map = new Map(localCollections);
+		const base = new Map((activeInputs?.collections ?? []).map((item) => [item.subject_id, item]));
+		for (const task of visibleCollectionTasks) {
+			const id = task.payload.subjectId;
+			const original = map.get(id) ?? base.get(id) ?? sourceCollections.find((item) => item.subject_id === id);
+			const patch = getOptimisticCollectionPatchForSubject(id, visibleCollectionTasks);
+			if (original && patch) map.set(id, { ...original, ...patch });
+		}
+		return map;
+	}, [localCollections, visibleCollectionTasks, activeInputs, sourceCollections]);
+	const projectedState = useMemo(() => activeInputs
+		? projectCollectionsDisplay(activeInputs, collectionType, nowMs, airingOffsets, userCollections) : null,
+	[activeInputs, collectionType, nowMs, airingOffsets, userCollections]);
+	const visibleSorted = projectedState?.sorted ?? EMPTY_SORTED_COLLECTIONS;
+	const visibleDisplayLabelMap = projectedState?.displayLabelMap ?? EMPTY_DISPLAY_LABEL_MAP;
+	const visibleJustUpdatedSubjectIds = projectedState?.justUpdatedSubjectIds ?? EMPTY_SUBJECT_ID_SET;
 	const collections = useMemo(
 		() => visibleSorted.filter((item) => matchesSearch(item.collection, searchQuery)),
 		[searchQuery, visibleSorted],
@@ -1568,67 +1477,48 @@ export default function CollectionsPage() {
 	}, [totalPages, page]);
 
 	async function refresh() {
-		if (!username) return;
+		if (!username || refreshing) return;
 		setRefreshing(true);
+		setManualRequestsDone(false);
+		forceAiringRefreshRef.current = true;
+		const original = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey)
+			?? { data: [], total: 0, limit: 100, offset: 0 };
+		const initialRevision = localRevisionRef.current.revision;
+		const mergeLatest = (data: PagedResponse<UserCollection>, liveData: PagedResponse<UserCollection>, originalData: PagedResponse<UserCollection>) =>
+			mergeLatestCollections(data, liveData, originalData, initialRevision);
 		try {
-			airingRefreshGenerationRef.current += 1;
+			// 强制回源但保留失败可用的基础缓存，不再先删光排期制造无数据中间态。
 			await Promise.all([
-				queryClient.cancelQueries({
-					queryKey: ["anilist-airing-times-cache-v2"],
+				refreshQueryDataIfChanged({
+					queryClient, queryKey: collectionsQueryKey, refreshKey: collectionsCacheKey, currentData: original,
+					refresh: () => loadCollections(collectionType, username, true, async (data) => {
+						const tasks = await getCollectionTaskQueue();
+						const live = queryClient.getQueryData<PagedResponse<UserCollection>>(collectionsQueryKey) ?? original;
+						return mergeLatest(mergePendingCollectionTasks({ data, currentData: live, tasks, username, collectionType }), live, original);
+					}), mergeLatest,
 				}),
-				queryClient.cancelQueries({
-					queryKey: ["anilist-airing-times-v2"],
+				refreshQueryDataIfChanged({
+					queryClient, queryKey: ["calendar"], refreshKey: "calendar",
+					currentData: queryClient.getQueryData<CalendarItem[]>(["calendar"]) ?? EMPTY_CALENDAR,
+					refresh: () => loadCalendar(true),
 				}),
-				queryClient.cancelQueries({ queryKey: ["episodes-schedule-v2"] }),
 			]);
 			await Promise.all([
-				deleteCachedValuesByPrefix(AIRING_CACHE_PREFIX),
-				deleteCachedValuesByPrefix(EPISODES_CACHE_PREFIX),
+				queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] }),
+				queryClient.invalidateQueries({ queryKey: ["episode-totals"] }),
+				queryClient.invalidateQueries({ queryKey: ["episodes-schedule-local-v2"] }),
+				queryClient.invalidateQueries({ queryKey: ["anilist-airing-times-cache-v2"] }),
 			]);
-			setCachedEpisodeSnapshot({
-				key: "",
-				value: null,
-				version: Date.now(),
-				complete: false,
-			});
-			queryClient.removeQueries({
-				queryKey: ["anilist-airing-times-cache-v2"],
-			});
-			queryClient.removeQueries({ queryKey: ["anilist-airing-times-v2"] });
-			queryClient.removeQueries({ queryKey: ["episodes-schedule-v2"] });
+			await Promise.all([
+				queryClient.invalidateQueries({ queryKey: ["anilist-airing-times-v2"] }),
+				queryClient.invalidateQueries({ queryKey: ["episodes-schedule-v2"] }),
+			]);
 			syncClock();
-			const [nextCollections, nextCalendar] = await Promise.all([
-				loadCollections(collectionType, username, true),
-				loadCalendar(true),
-			]);
-			queryClient.setQueryData(
-				["collections", collectionType, username],
-				nextCollections,
-			);
-			queryClient.setQueryData(["calendar"], nextCalendar);
-			setCachedCollectionsSnapshot({
-				key: collectionsCacheKey,
-				value: nextCollections,
-				version: Date.now(),
-				complete: true,
-			});
-			setCachedCalendarSnapshot({
-				key: "calendar",
-				value: nextCalendar,
-				version: Date.now(),
-				complete: true,
-			});
-			queryClient.invalidateQueries({ queryKey: ["totalep-backfill"] });
-			queryClient.invalidateQueries({ queryKey: ["episode-totals"] });
-			queryClient.invalidateQueries({
-				queryKey: ["anilist-airing-times-cache-v2"],
-			});
-			queryClient.invalidateQueries({ queryKey: ["anilist-airing-times-v2"] });
-			queryClient.invalidateQueries({ queryKey: ["episodes-schedule-v2"] });
 		} catch (error) {
 			alert("刷新失败", error instanceof Error ? error.message : "请稍后重试");
 		} finally {
-			setRefreshing(false);
+			// 还可能有成员变化引发的新组合查询；spinner 和最终提交都等它们真正结束。
+			setManualRequestsDone(true);
 		}
 	}
 
@@ -1641,10 +1531,8 @@ export default function CollectionsPage() {
 	const displayError = collectionsQuery.error ?? calendarQuery.error;
 	// 只等待本地快照完成提交；网络刷新和辅助数据请求不再阻塞首屏。
 	const isDisplayError =
-		!activeCommittedState &&
-		!canCommitCacheSnapshot &&
-		(isDisplayDependencyError || (collectionsQuery.isError && !collectionsQuery.data));
-	const isDisplayLoading = !activeCommittedState && !isDisplayError;
+		!activeInputs && !canCommitCacheSnapshot && collectionsQuery.isError && !collectionsQuery.data;
+	const isDisplayLoading = !activeInputs && !isDisplayError;
 	if (checking) return <LoadingState label="检查登录状态" />;
 	if (!loggedIn) return <LoadingState label="跳转登录" />;
 
@@ -1698,8 +1586,8 @@ export default function CollectionsPage() {
 								<View style={styles.headerRow}>
 									<Text style={styles.count}>
 										{CollectionTypeLabel[collectionType]} · {collections.length}
-										{collections.length !== (collectionsQuery.data?.total ?? 0)
-											? ` / ${collectionsQuery.data?.total ?? 0}`
+										{collections.length !== visibleSorted.length
+											? ` / ${visibleSorted.length}`
 											: ""}
 									</Text>
 									{collections.length > 0 && (

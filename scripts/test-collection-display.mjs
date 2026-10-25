@@ -53,6 +53,8 @@ assert.deepEqual(
   localData,
   "网络请求未完成时应继续展示本地数据",
 );
+// helper 先注册共享 pending，再在 microtask 中启动实际刷新。
+await Promise.resolve();
 resolveRefresh(freshData);
 assert.equal(await refreshTask, true, "网络刷新产生新数据时应报告已更新");
 assert.deepEqual(
@@ -80,6 +82,7 @@ const protectedRefresh = refreshQueryDataIfChanged({
 });
 const userEditedData = { data: [{ subject_id: 3, ep_status: 5 }], total: 1 };
 protectedClient.setQueryData(protectedKey, userEditedData);
+await Promise.resolve();
 resolveProtectedRefresh(protectedFreshData);
 assert.equal(
   await protectedRefresh,

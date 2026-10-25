@@ -63,6 +63,38 @@ export function mergeCollectionPatchIntoList({
     : removeCollection(data, subjectId);
 }
 
+/** 只保留请求期间改变的收藏目标字段与成员，条目元数据优先使用网络快照。 */
+export function mergeConcurrentCollectionChanges({
+  data,
+  originalData,
+  liveData,
+  collectionType,
+}: {
+  data: PagedResponse<UserCollection>;
+  originalData: PagedResponse<UserCollection>;
+  liveData: PagedResponse<UserCollection>;
+  collectionType: CollectionType;
+}): PagedResponse<UserCollection> {
+  const originalById = new Map(originalData.data.map((item) => [item.subject_id, item]));
+  const liveById = new Map(liveData.data.map((item) => [item.subject_id, item]));
+  let next = data;
+  for (const id of originalById.keys()) {
+    if (!liveById.has(id)) next = removeCollection(next, id);
+  }
+  for (const live of liveData.data) {
+    const original = originalById.get(live.subject_id);
+    const patch: CollectionPatch = {};
+    if (!original || original.type !== live.type) patch.type = live.type;
+    if (!original || original.ep_status !== live.ep_status) patch.ep_status = live.ep_status;
+    // 未变字段接受服务端新值，不能因另一个字段发生变化而一并冻结。
+    if (patch.type === undefined && patch.ep_status === undefined) continue;
+    next = mergeCollectionPatchIntoList({
+      data: next, subjectId: live.subject_id, patch, collectionType, fallbackCollection: live,
+    });
+  }
+  return next;
+}
+
 /** 用户意图变化应立即展示；单纯的播出排期变化仍由页面提交门处理。 */
 export function hasCollectionStateChanged(
   previous: readonly SortedCollection[],

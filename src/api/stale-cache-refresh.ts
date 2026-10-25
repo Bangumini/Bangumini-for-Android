@@ -1,6 +1,32 @@
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 
-const refreshInFlight = new Set<string>();
+const refreshInFlight = new WeakMap<QueryClient, Map<string, Promise<boolean>>>();
+const refreshListeners = new WeakMap<QueryClient, Set<() => void>>();
+
+export function hasCacheRefreshInFlight(client: QueryClient, keys: readonly string[]): boolean {
+  return keys.some((key) => refreshInFlight.get(client)?.has(key));
+}
+
+export function subscribeCacheRefresh(client: QueryClient, listener: () => void): () => void {
+  let listeners = refreshListeners.get(client);
+  if (!listeners) {
+    listeners = new Set();
+    refreshListeners.set(client, listeners);
+  }
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+function notifyRefresh(client: QueryClient) {
+  for (const listener of [...(refreshListeners.get(client) ?? [])]) {
+    try {
+      listener();
+    } catch (error) {
+      // 单个订阅者异常不能阻断其他通知，也不能影响任务清理。
+      console.warn("[stale-cache-refresh] refresh listener failed", error);
+    }
+  }
+}
 
 export function isCacheStale(updatedAt: number, maxAgeMs: number, now = Date.now()) {
   return now - updatedAt > maxAgeMs;
@@ -21,6 +47,7 @@ export function refreshQueryDataIfChanged<T>({
   currentData,
   refresh,
   hasLocalChanges,
+  mergeLatest,
 }: {
   queryClient: QueryClient;
   queryKey: QueryKey;
@@ -28,14 +55,25 @@ export function refreshQueryDataIfChanged<T>({
   currentData: T;
   refresh: () => Promise<T>;
   hasLocalChanges?: (liveData: T, originalData: T) => boolean;
-}): Promise<boolean> | null {
-  if (refreshInFlight.has(refreshKey)) return null;
-  refreshInFlight.add(refreshKey);
+  mergeLatest?: (nextData: T, liveData: T, originalData: T) => T;
+}): Promise<boolean> {
+  let pending = refreshInFlight.get(queryClient);
+  if (!pending) {
+    pending = new Map();
+    refreshInFlight.set(queryClient, pending);
+  }
+  const existing = pending.get(refreshKey);
+  if (existing) return existing;
 
-  return refresh()
-    .then((nextData) => {
+  // 延后执行也能捕获同步 throw，并确保 refresh 或通知重入时已注册共享任务。
+  const task = Promise.resolve().then(refresh)
+    .then((result) => {
       const liveData = queryClient.getQueryData<T>(queryKey);
+      const nextData = mergeLatest && liveData !== undefined
+        ? mergeLatest(result, liveData, currentData)
+        : result;
       if (
+        !mergeLatest &&
         liveData !== undefined &&
         !isSamePayload(liveData, currentData) &&
         !isSamePayload(liveData, nextData) &&
@@ -45,7 +83,7 @@ export function refreshQueryDataIfChanged<T>({
         return false;
       }
 
-      const baseData = liveData ?? currentData;
+      const baseData = liveData === undefined ? currentData : liveData;
       if (!isSamePayload(baseData, nextData)) {
         queryClient.setQueryData<T>(queryKey, nextData);
         return true;
@@ -57,6 +95,10 @@ export function refreshQueryDataIfChanged<T>({
       return false;
     })
     .finally(() => {
-      refreshInFlight.delete(refreshKey);
+      pending.delete(refreshKey);
+      notifyRefresh(queryClient);
     });
+  pending.set(refreshKey, task);
+  notifyRefresh(queryClient);
+  return task;
 }

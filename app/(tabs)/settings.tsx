@@ -31,6 +31,7 @@ import {
 } from "../../src/api/update";
 import type { DownloadProgress } from "../../src/api/update";
 import { useAuth } from "../../src/hooks/useAuth";
+import AiringOffsetSyncSettings from "../../src/components/AiringOffsetSyncSettings";
 import { useAlert } from "../../src/components/Dialog";
 import { colors } from "../../src/theme/colors";
 
@@ -268,6 +269,8 @@ export default function SettingsPage() {
 					/>
 				</SettingsRow>
 			</View>
+
+			<AiringOffsetSyncSettings />
 
 			<View style={styles.section}>
 				<Text style={styles.sectionTitle}>缓存</Text>

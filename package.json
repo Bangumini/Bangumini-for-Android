@@ -7,14 +7,17 @@
     "start": "expo start",
     "android": "expo run:android --app-id com.bangumini.app.dev",
     "prebuild:android": "NODE_OPTIONS=\"--no-experimental-strip-types\" npx expo prebuild --platform android",
-    "test": "node --experimental-strip-types --experimental-loader=./scripts/test-support/oauth-mock-loader.mjs scripts/test-auth-renewal.mjs && node --experimental-strip-types scripts/test-airing-schedule.mjs && node --experimental-strip-types scripts/test-airing-timezones.mjs && node --experimental-strip-types scripts/test-airing-cache.mjs && node --experimental-strip-types scripts/test-anilist-airing.mjs && node --experimental-strip-types scripts/test-bgm-episodes.mjs && node --experimental-strip-types scripts/test-subject-title-copy.mjs && node --experimental-strip-types scripts/test-collection-interest-sort.mjs && node --experimental-strip-types scripts/test-collection-display.mjs && node --experimental-strip-types scripts/test-collection-cache.mjs && node --experimental-strip-types scripts/test-collection-worker.mjs && node --experimental-strip-types scripts/test-airing-offset.mjs && node --experimental-strip-types scripts/test-airing-offset-settings.mjs && node --experimental-strip-types scripts/test-stale-cache-refresh.mjs && node --experimental-strip-types scripts/test-subject-detail-two-phase.mjs && node --experimental-strip-types scripts/test-collections-render.mjs",
+    "test": "node --experimental-strip-types --experimental-loader=./scripts/test-support/oauth-mock-loader.mjs scripts/test-auth-renewal.mjs && node --experimental-strip-types scripts/test-airing-schedule.mjs && node --experimental-strip-types scripts/test-airing-timezones.mjs && node --experimental-strip-types scripts/test-airing-cache.mjs && node --experimental-strip-types scripts/test-anilist-airing.mjs && node --experimental-strip-types scripts/test-bgm-episodes.mjs && node --experimental-strip-types scripts/test-subject-title-copy.mjs && node --experimental-strip-types scripts/test-collection-interest-sort.mjs && node --experimental-strip-types scripts/test-collection-display.mjs && node --experimental-strip-types scripts/test-collection-cache.mjs && node --experimental-strip-types scripts/test-collection-worker.mjs && node --experimental-strip-types scripts/test-airing-offset.mjs && node --experimental-strip-types scripts/test-airing-offset-settings.mjs && node --experimental-strip-types scripts/test-stale-cache-refresh.mjs && node --experimental-strip-types scripts/test-subject-detail-two-phase.mjs && node --experimental-strip-types scripts/test-collections-render.mjs && npm run test:offset-sync",
+    "test:offset-sync": "node --experimental-strip-types scripts/test-airing-offset-accounts.mjs && node --experimental-strip-types scripts/test-airing-offset-sync-model.mjs && node --experimental-strip-types scripts/test-offset-sync-config-store.mjs && node --experimental-strip-types scripts/test-offset-sync-storage.mjs && node scripts/test-offset-sync-native-runtime.mjs && node --experimental-strip-types scripts/test-airing-offset-sync-manager.mjs && node --experimental-strip-types scripts/test-airing-offset-sync-settings.mjs && node --experimental-strip-types scripts/test-airing-offset-sync-bootstrap.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "ios": "expo run:ios"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.750.0",
     "@expo/vector-icons": "~14.0.4",
     "@react-native-async-storage/async-storage": "^1.23.1",
+    "@smithy/fetch-http-handler": "5.5.2",
     "@tanstack/react-query": "^5.100.11",
     "expo": "~52.0.47",
     "expo-asset": "~11.0.5",
@@ -35,13 +38,17 @@
     "expo-status-bar": "~2.0.1",
     "expo-system-ui": "~4.0.9",
     "expo-web-browser": "~14.0.2",
+    "fast-text-encoding": "1.0.6",
     "pinyin-pro": "^3.28.1",
     "react": "18.3.1",
     "react-native": "0.76.9",
     "react-native-gesture-handler": "~2.20.2",
     "react-native-reanimated": "~3.16.7",
     "react-native-safe-area-context": "4.12.0",
-    "react-native-screens": "~4.4.0"
+    "react-native-screens": "~4.4.0",
+    "react-native-url-polyfill": "2.0.0",
+    "web-streams-polyfill": "3.3.3",
+    "webdav": "5.11.0"
   },
   "devDependencies": {
     "@types/react": "~18.3.12",

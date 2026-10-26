@@ -1,4 +1,4 @@
-// 编译真实 Android 存储、hook 和原生控件；仅替换 AsyncStorage 与原生 host，不复制业务逻辑。
+// 编译真实 Android 存储、hook 和原生控件；仅替换 AsyncStorage、UUID 与原生 host，不复制业务逻辑。
 // 运行：node --experimental-strip-types scripts/test-airing-offset-settings.mjs
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -14,6 +14,7 @@ const directory = await mkdtemp(join(tmpdir(), "bangumini-airing-offset-"));
 const url = (name) => pathToFileURL(join(directory, name)).href;
 await writeFile(join(directory, "mocks.mjs"), `
 import React from ${JSON.stringify(import.meta.resolve("react"))};
+export { randomUUID } from "node:crypto";
 export const disk = new Map();
 export const io = { failReads: false, failWrites: false, readGate: null, writeGate: null, reads: 0, writes: 0, activeWrites: 0, maxWrites: 0 };
 export default {
@@ -50,7 +51,7 @@ async function compile(relative, name, replacements = {}) {
     if (!replacement && specifier.includes("shared/")) replacement = new URL(specifier.slice(specifier.indexOf("shared/")).replace(/\.ts$/, "") + ".ts", root).href;
     if (!replacement && specifier.includes("theme/colors")) replacement = new URL("src/theme/colors.ts", root).href;
     if (!replacement && ["react", "react/jsx-runtime"].includes(specifier)) replacement = import.meta.resolve(specifier);
-    if (!replacement && ["react-native", "@react-native-async-storage/async-storage"].includes(specifier)) replacement = url("mocks.mjs");
+    if (!replacement && ["react-native", "@react-native-async-storage/async-storage", "expo-crypto"].includes(specifier)) replacement = url("mocks.mjs");
     if (!replacement) throw new Error(`测试未映射导入：${relative}: ${specifier}`);
     source = source.replaceAll(JSON.stringify(specifier), JSON.stringify(replacement));
   }
@@ -66,8 +67,13 @@ let imports = 0;
 const load = () => import(url("api.mjs") + `?restart=${imports++}`);
 const api = await import(url("api.mjs"));
 const { getAiringOffsetsSnapshot: get, setAiringOffsetDays: set, initializeAiringOffsets: initialize } = api;
-const key = api.AIRING_OFFSETS_STORAGE_KEY;
-assert.equal(key, "bangumini_airing_offsets");
+const key = api.AIRING_OFFSET_ACCOUNTS_STORAGE_KEY;
+const legacyKey = api.AIRING_OFFSETS_STORAGE_KEY;
+assert.equal(legacyKey, "bangumini_airing_offsets");
+const guestDatabase = offsets => JSON.stringify({ version: 1, legacyOwner: null, accounts: { guest: {
+  records: Object.fromEntries(Object.entries(offsets).map(([id, days]) => [id, { days, revision: `fixture-${id}`, updatedAt: 1 }])),
+  bases: {}, syncedAt: {},
+} } });
 const empty = get();
 assert.deepEqual(empty, {});
 assert.strictEqual(get(), empty);
@@ -84,7 +90,8 @@ await set(10, -2);
 assert.strictEqual(get(), same);
 assert.equal(notifications, count);
 await set(30, 0);
-assert(!Object.hasOwn(JSON.parse(disk.get(key)), "30"));
+assert.equal(get()[30], undefined);
+assert.equal((await api.readAiringOffsetAccountState(null)).records[30].days, 0, "恢复默认保留 tombstone，UI 不含零值");
 await Promise.all([set(10, 365), set(20, -365)]);
 assert.deepEqual(get(), { 10: 365, 20: -365 });
 const restored = await load();
@@ -117,13 +124,14 @@ for (const raw of [
   '{"10":-1,"20":2,"30":0,"40":366,"50":-366,"60":0.25,"70":"1","80":null,"0":1,"-1":2,"1.5":3,"001":2,"9007199254740992":1,"__proto__":3}',
   "broken JSON", "[]", "null", "7", '"string"',
 ]) {
-  disk.set(key, raw);
+  disk.delete(key);
+  disk.set(legacyKey, raw);
   const fresh = await load();
-  await fresh.initializeAiringOffsets();
+  await fresh.setAiringOffsetAccount("legacy-test");
   assert.deepEqual(fresh.getAiringOffsetsSnapshot(), raw.startsWith('{"10"') ? { 10: -1, 20: 2 } : {});
 }
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-disk.set(key, '{"90":-3}');
+disk.set(key, guestDatabase({ 90: -3 }));
 const delayed = await load();
 const gate = deferred();
 io.readGate = gate.promise;
@@ -137,12 +145,13 @@ gate.resolve();
 await Promise.all([warming, warmingAgain, saving]);
 io.readGate = null;
 assert.deepEqual(delayed.getAiringOffsetsSnapshot(), { 10: 2, 90: -3 }, "初始化期间保存不得被旧读取覆盖，也不能丢失磁盘其他偏好");
+const diskBeforeReadFailure = disk.get(key);
 const readFailure = await load();
 io.failReads = true;
 await readFailure.initializeAiringOffsets();
 assert.deepEqual(readFailure.getAiringOffsetsSnapshot(), {}, "恢复失败安全显示默认，不抛未处理拒绝");
 await assert.rejects(readFailure.setAiringOffsetDays(10, 1), /read/);
-assert.deepEqual(JSON.parse(disk.get(key)), { 10: 2, 90: -3 }, "读取失败不能以空快照覆盖磁盘");
+assert.equal(disk.get(key), diskBeforeReadFailure, "读取失败不能以空快照覆盖磁盘");
 io.failReads = false;
 await readFailure.initializeAiringOffsets();
 assert.deepEqual(readFailure.getAiringOffsetsSnapshot(), { 10: 2, 90: -3 }, "恢复失败允许重试");
@@ -160,13 +169,34 @@ assert.strictEqual(latest, get());
 const stableRenders = renders;
 await act(async () => { await set(10, -1); });
 assert.equal(renders, stableRenders, "保存同值不能导致 hook 重渲染循环");
+await act(async () => {
+  await api.updateAiringOffsetAccountState(null, current => ({ ...current, syncedAt: { test: 123 } }));
+});
+assert.equal(renders, stableRenders, "仅 metadata 改变不通知旧 hook");
+await act(async () => { await api.setAiringOffsetAccount("hook-account-a"); });
+assert.deepEqual(latest, { 10: -1 }, "真实 hook 首次登录迁入 guest 编辑");
+assert.deepEqual((await api.readAiringOffsetAccountState(null)).records, {}, "guest 编辑迁入后清空原 scope");
+await act(async () => { await set(10, -1); });
+assert.deepEqual(latest, { 10: -1 });
+await act(async () => { await api.setAiringOffsetAccount("hook-account-b"); });
+assert.deepEqual(latest, {}, "真实 hook 切账号不泄漏上一账号偏置");
+const backgroundRenders = renders;
+await act(async () => {
+  await api.updateAiringOffsetAccountState("hook-account-a", current => ({ ...current, records: {
+    ...current.records, 10: { days: 2, revision: "background", updatedAt: 12 },
+  } }));
+});
+assert.equal(renders, backgroundRenders, "后台账号保存不刷新当前 hook");
+await act(async () => { await api.setAiringOffsetAccount("hook-account-a"); });
+assert.deepEqual(latest, { 10: 2 });
+const beforeUnmountRenders = renders;
 act(() => renderer.unmount());
 await set(10, 0);
-assert.equal(renders, stableRenders);
+assert.equal(renders, beforeUnmountRenders);
 // 新模块的 hook 自己触发初始化，不依赖 RootLayout。
 await compile("src/hooks/useAiringOffsets.ts", "cold-hook.mjs", { "../api/airing-offset": url("cold-api.mjs"), "../api/airing-offset.ts": url("cold-api.mjs") });
 await compile("src/api/airing-offset.ts", "cold-api.mjs");
-disk.set(key, '{"77":7}');
+disk.set(key, guestDatabase({ 77: 7 }));
 const { useAiringOffsets: useCold } = await import(url("cold-hook.mjs"));
 let cold;
 function ColdConsumer() { cold = useCold(); return null; }
@@ -187,7 +217,7 @@ const input = () => renderer.root.findByType("TextInput");
 const change = value => act(() => input().props.onChangeText(value));
 const press = async label => { await act(async () => { button(label).props.onPress(); }); };
 assert.match(text(), /放送日期偏置/);
-assert.match(text(), /仅保存在本机/);
+assert.match(text(), /偏置天数（负数提前，正数延后）/);
 assert(input().props.accessibilityLabel);
 const writesBeforeDraft = io.writes;
 change("-");

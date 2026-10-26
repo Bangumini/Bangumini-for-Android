@@ -17,6 +17,7 @@ import {
 } from "../src/api/oauth";
 import { startCollectionTaskWorker } from "../src/api/collection-tasks";
 import { initializeAiringOffsets } from "../src/api/airing-offset";
+import AiringOffsetSyncBootstrap from "../src/components/AiringOffsetSyncBootstrap";
 import { DialogProvider, useAlert } from "../src/components/Dialog";
 import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { colors } from "../src/theme/colors";
@@ -153,23 +154,25 @@ export default function RootLayout() {
               <AuthProvider>
                 <AuthSessionGuard />
                 <CollectionTaskWorkerBootstrap />
-                <StatusBar style="light" />
-                <Stack
-                  screenOptions={{
-                    headerStyle: { backgroundColor: colors.background },
-                    headerTintColor: colors.text,
-                    headerTitleStyle: { fontWeight: "700" },
-                    contentStyle: { backgroundColor: colors.background },
-                  }}
-                >
-                  <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-                  <Stack.Screen name="login" options={{ title: "登录", presentation: "modal" }} />
-                  <Stack.Screen name="subject/[id]" options={{ title: "条目详情" }} />
-                  <Stack.Screen
-                    name="oauth/callback"
-                    options={{ headerShown: false, presentation: "modal" }}
-                  />
-                </Stack>
+                <AiringOffsetSyncBootstrap>
+                  <StatusBar style="light" />
+                  <Stack
+                    screenOptions={{
+                      headerStyle: { backgroundColor: colors.background },
+                      headerTintColor: colors.text,
+                      headerTitleStyle: { fontWeight: "700" },
+                      contentStyle: { backgroundColor: colors.background },
+                    }}
+                  >
+                    <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                    <Stack.Screen name="login" options={{ title: "登录", presentation: "modal" }} />
+                    <Stack.Screen name="subject/[id]" options={{ title: "条目详情" }} />
+                    <Stack.Screen
+                      name="oauth/callback"
+                      options={{ headerShown: false, presentation: "modal" }}
+                    />
+                  </Stack>
+                </AiringOffsetSyncBootstrap>
               </AuthProvider>
             </DialogProvider>
           </QueryClientProvider>

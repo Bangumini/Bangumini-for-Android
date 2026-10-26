@@ -410,17 +410,6 @@ function SubjectDetailContent() {
         </View>
       </View>
 
-      {subject.type === 2 ? (
-        <AiringOffsetControl
-          key={subjectId}
-          subjectId={subjectId}
-          appliedDays={airingOffsetDays}
-          originalDate={subject.date}
-          airWeekday={subject.air_weekday}
-          previewEpisode={previewEpisode}
-        />
-      ) : null}
-
       <Section title="收藏状态">
         {checking ? <Text style={styles.muted}>检查登录状态</Text> : null}
         <View style={styles.optionRow}>
@@ -486,6 +475,17 @@ function SubjectDetailContent() {
           </Pressable>
         </View>
       </Section>
+
+      {subject.type === 2 ? (
+        <AiringOffsetControl
+          key={subjectId}
+          subjectId={subjectId}
+          appliedDays={airingOffsetDays}
+          originalDate={subject.date}
+          airWeekday={subject.air_weekday}
+          previewEpisode={previewEpisode}
+        />
+      ) : null}
 
       <Section title="简介">
         {summaryBlocks.length ? (

@@ -104,7 +104,6 @@ export default function AiringOffsetControl({
           {formatAiringOffsetDays(appliedDays)}
         </Text>
       </View>
-      <Text style={styles.muted}>仅保存在本机，不修改 Bangumi 数据；排期更新后请复核</Text>
       <Text style={styles.label}>偏置天数（负数提前，正数延后）</Text>
       <TextInput
         accessibilityLabel="偏置天数（负数提前，正数延后）"
@@ -132,7 +131,6 @@ export default function AiringOffsetControl({
             ? `第 ${previewEpisode.sort} 集：${previewEpisode.airdate} → ${valid ? shiftAiringDate(previewEpisode.airdate, days) : "—"}`
             : "暂无放送日期"}
       </Text>
-      {previewWeekday && <Text style={styles.muted}>放送星期：{weekdayLabel(airWeekday)} → {previewWeekday}</Text>}
       <View style={styles.actions}>
         {button("保存", !valid, () => { void save(days); }, true)}
         {button("恢复默认", false, () => { void save(0); })}
